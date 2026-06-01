@@ -4,6 +4,17 @@ All notable changes to `gdoc` are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.5] — 2026-06-01
+
+### Fixed
+- **`gdoc toc --tab`** now emits heading deep links in Google's own
+  canonical form — `…/edit?tab=t.<id>#heading=h.<anchor>`. Previously the
+  tab id was double-prefixed (`t.t.<id>`, because `tabProperties.tabId`
+  already carries the `t.` prefix) and `&tab=…` was appended inside the
+  URL fragment instead of as a query parameter, so the links didn't
+  reliably open the right tab. `cmd_toc` now builds the URL via the
+  shared `build_doc_url()` helper. PR #18.
+
 ## [0.7.4] — 2026-05-23
 
 ### Added
