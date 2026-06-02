@@ -420,6 +420,125 @@ class TestFindTextBody:
 
         assert find_text_in_document(None, "text") == []
 
+    @staticmethod
+    def _cell(text, start):
+        return {"content": [{
+            "paragraph": {
+                "elements": [{"startIndex": start, "textRun": {"content": text}}],
+            },
+        }]}
+
+    def test_find_text_in_table_cell(self):
+        from gdoc.api.docs import find_text_in_document
+
+        body = {"content": [{
+            "table": {"tableRows": [{"tableCells": [
+                self._cell("Label\n", 5),
+                self._cell("Answer here\n", 20),
+            ]}]},
+        }]}
+        matches = find_text_in_document(None, "Answer", body=body)
+        assert len(matches) == 1
+        assert matches[0]["startIndex"] == 20
+        assert matches[0]["endIndex"] == 26
+
+    def test_find_text_in_nested_table(self):
+        from gdoc.api.docs import find_text_in_document
+
+        inner = {"table": {"tableRows": [{"tableCells": [
+            self._cell("deep value\n", 50),
+        ]}]}}
+        body = {"content": [{
+            "table": {"tableRows": [{"tableCells": [
+                {"content": [inner]},
+            ]}]},
+        }]}
+        matches = find_text_in_document(None, "deep", body=body)
+        assert len(matches) == 1
+        assert matches[0]["startIndex"] == 50
+
+    def test_match_does_not_span_cells(self):
+        from gdoc.api.docs import find_text_in_document
+
+        body = {"content": [{
+            "table": {"tableRows": [{"tableCells": [
+                self._cell("foo\n", 10),
+                self._cell("bar\n", 30),
+            ]}]},
+        }]}
+        # Neither a plain concatenation ("foobar") nor a newline-spanning
+        # anchor ("foo\nbar") may match across the cell boundary \u2014 that would
+        # yield an invalid cross-cell delete range.
+        assert find_text_in_document(None, "foobar", body=body) == []
+        assert find_text_in_document(None, "foo\nbar", body=body) == []
+        # Each cell is still searchable on its own.
+        assert find_text_in_document(None, "foo", body=body)[0]["startIndex"] == 10
+        assert find_text_in_document(None, "bar", body=body)[0]["startIndex"] == 30
+
+    def test_paragraph_and_table_coexist(self):
+        from gdoc.api.docs import find_text_in_document
+
+        body = {"content": [
+            {"paragraph": {"elements": [
+                {"startIndex": 1, "textRun": {"content": "hello world\n"}},
+            ]}},
+            {"table": {"tableRows": [{"tableCells": [
+                self._cell("world\n", 20),
+            ]}]}},
+        ]}
+        matches = find_text_in_document(None, "world", body=body)
+        assert [m["startIndex"] for m in matches] == [7, 20]
+
+    def test_normalize_matches_smart_quotes(self):
+        from gdoc.api.docs import find_text_in_document
+
+        body = {"content": [{
+            "paragraph": {"elements": [{
+                "startIndex": 1, "textRun": {"content": "JP\u2019s job\n"},
+            }]},
+        }]}
+        assert find_text_in_document(None, "JP's job", body=body) == []
+        m = find_text_in_document(None, "JP's job", body=body, normalize=True)
+        assert len(m) == 1 and m[0]["startIndex"] == 1
+
+
+class TestDiagnoseNoMatch:
+    @staticmethod
+    def _para_body(text):
+        return {"content": [{
+            "paragraph": {"elements": [{
+                "startIndex": 1, "textRun": {"content": text},
+            }]},
+        }]}
+
+    def test_suggests_normalize_on_quote_mismatch(self):
+        from gdoc.api.docs import diagnose_no_match
+
+        reason = diagnose_no_match(None, "JP's job", body=self._para_body("JP\u2019s job\n"))
+        assert reason is not None and "--normalize" in reason
+
+    def test_reports_whitespace_difference(self):
+        from gdoc.api.docs import diagnose_no_match
+
+        reason = diagnose_no_match(
+            None, "a b", body=self._para_body("a\nb\n"),
+        )
+        assert reason is not None and "whitespace" in reason
+
+    def test_no_near_match_returns_none(self):
+        from gdoc.api.docs import diagnose_no_match
+
+        assert diagnose_no_match(None, "zzz", body=self._para_body("abc\n")) is None
+
+    def test_already_normalized_skips_quote_suggestion(self):
+        from gdoc.api.docs import diagnose_no_match
+
+        reason = diagnose_no_match(
+            None, "JP's job", body=self._para_body("JP\u2019s job\n"),
+            already_normalized=True,
+        )
+        assert reason is None or "--normalize" not in reason
+
 
 class TestAddTab:
     @patch("gdoc.api.docs.get_docs_service")
@@ -540,7 +659,7 @@ class TestCountDocumentTabs:
 
 
 class TestZeroWidthReplace:
-    """Zero-width matches in replace_formatted act as pure inserts — no
+    """Zero-width matches in replace_formatted act as pure inserts \u2014 no
     deleteContentRange is emitted (Docs API rejects empty ranges)."""
 
     @patch("gdoc.api.docs._build_cleanup_requests", return_value=[])

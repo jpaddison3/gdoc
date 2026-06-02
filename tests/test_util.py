@@ -129,3 +129,28 @@ class TestConfirmDestructive:
             with pytest.raises(GdocError, match="Cancelled") as exc:
                 confirm_destructive("delete something", force=False)
             assert exc.value.exit_code == 3
+
+
+class TestFoldTypography:
+    def test_folds_smart_single_quotes(self):
+        from gdoc.util import fold_typography
+
+        assert fold_typography("JP\u2019s job") == "JP's job"
+        assert fold_typography("\u2018hi\u2019") == "'hi'"
+
+    def test_folds_smart_double_quotes_and_dashes(self):
+        from gdoc.util import fold_typography
+
+        assert fold_typography("\u201cquote\u201d") == '"quote"'
+        assert fold_typography("a \u2013 b \u2014 c") == "a - b - c"
+
+    def test_length_preserving(self):
+        from gdoc.util import fold_typography
+
+        s = "\u2018a\u2019 \u201cb\u201d \u2013 \u2014"
+        assert len(fold_typography(s)) == len(s)
+
+    def test_plain_ascii_unchanged(self):
+        from gdoc.util import fold_typography
+
+        assert fold_typography("plain 'text' - ok") == "plain 'text' - ok"

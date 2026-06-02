@@ -614,6 +614,10 @@ def cmd_edit(args) -> int:
     quiet = getattr(args, "quiet", False)
     replace_all = getattr(args, "all", False)
     case_sensitive = getattr(args, "case_sensitive", False)
+    normalize = getattr(args, "normalize", False)
+    cell = getattr(args, "cell", None)
+    col = getattr(args, "col", None)
+    table_index = getattr(args, "table", None)
 
     # Resolve text from args or files (fail fast before API calls)
     old_text = args.old_text
@@ -621,7 +625,33 @@ def cmd_edit(args) -> int:
     old_file = getattr(args, "old_file", None)
     new_file = getattr(args, "new_file", None)
 
-    if old_file or new_file:
+    # Read stdin lazily, once, and only for an argument that is actually used
+    # (`-` on a positional that cell-mode ignores must not block on stdin).
+    _stdin_data = None
+
+    def read_stdin() -> str:
+        nonlocal _stdin_data
+        if _stdin_data is None:
+            _stdin_data = sys.stdin.read()
+        return _stdin_data
+
+    if cell is not None:
+        # Cell mode: the cell address is the anchor, so the single positional
+        # (or --new-file) carries the replacement — no separate old_text.
+        if new_file:
+            new_text = _read_file(new_file)
+        else:
+            replacement = new_text if new_text is not None else old_text
+            if replacement == "-":
+                replacement = read_stdin()
+            new_text = replacement
+        if new_text is None:
+            raise GdocError(
+                "cell edit needs replacement text "
+                "(NEW_TEXT positional or --new-file)",
+                exit_code=3,
+            )
+    elif old_file or new_file:
         if new_file and not old_file:
             raise GdocError(
                 "--new-file requires --old-file (needs an anchor). "
@@ -634,12 +664,24 @@ def cmd_edit(args) -> int:
         else:
             # --old-file alone → delete the matched range.
             new_text = ""
-    elif old_text is None or new_text is None:
-        raise GdocError(
-            "old_text and new_text required "
-            "(or use --old-file/--new-file)",
-            exit_code=3,
-        )
+    else:
+        # `-` reads that positional from stdin (one stream → at most one `-`).
+        if old_text == "-" and new_text == "-":
+            raise GdocError(
+                "only one argument can read from stdin ('-')", exit_code=3,
+            )
+        if old_text == "-" or new_text == "-":
+            stdin_data = read_stdin()
+            if old_text == "-":
+                old_text = stdin_data
+            if new_text == "-":
+                new_text = stdin_data
+        if old_text is None or new_text is None:
+            raise GdocError(
+                "old_text and new_text required "
+                "(or use --old-file/--new-file)",
+                exit_code=3,
+            )
 
     # Pre-flight awareness check
     from gdoc.notify import pre_flight
@@ -663,21 +705,39 @@ def cmd_edit(args) -> int:
         tabs = flatten_tabs(doc.get("tabs", []))
         tab_match = resolve_tab(tabs, tab_name)
         tab_id = tab_match["id"]
-        matches = find_text_in_document(
-            None, old_text, match_case=case_sensitive, body=tab_match["body"],
-        )
+        search_body = tab_match["body"]
     else:
         document = get_document(doc_id)
         revision_id = document.get("revisionId", "")
-        matches = find_text_in_document(document, old_text, match_case=case_sensitive)
+        search_body = document.get("body", {})
 
-    if not matches:
-        raise GdocError("no match found", exit_code=3)
-    if not replace_all and len(matches) > 1:
-        raise GdocError(
-            f"multiple matches ({len(matches)} found). Use --all",
-            exit_code=3,
+    if cell is not None:
+        from gdoc.api.docs import resolve_cell_range
+        cell_range = resolve_cell_range(
+            search_body, cell, col=col, table_index=table_index,
+            normalize=normalize,
         )
+        if cell_range is None:
+            raise GdocError(f"cell not found: {cell!r}", exit_code=3)
+        matches = [cell_range]
+    else:
+        matches = find_text_in_document(
+            None, old_text, match_case=case_sensitive,
+            body=search_body, normalize=normalize,
+        )
+        if not matches:
+            from gdoc.api.docs import diagnose_no_match
+            reason = diagnose_no_match(
+                None, old_text, match_case=case_sensitive,
+                body=search_body, already_normalized=normalize,
+            )
+            msg = "no match found" + (f"; {reason}" if reason else "")
+            raise GdocError(msg, exit_code=3)
+        if not replace_all and len(matches) > 1:
+            raise GdocError(
+                f"multiple matches ({len(matches)} found). Use --all",
+                exit_code=3,
+            )
 
     # Check if replacement contains tables — not supported with --all
     from gdoc.mdparse import parse_markdown as _parse_md
@@ -2079,6 +2139,26 @@ def build_parser() -> GdocArgumentParser:
     )
     edit_p.add_argument(
         "--case-sensitive", action="store_true", help="Case-sensitive matching"
+    )
+    edit_p.add_argument(
+        "--normalize", action="store_true",
+        help="Match through smart-quote/dash differences (\u2019 matches ')",
+    )
+    edit_p.add_argument(
+        "--cell",
+        help="Target a table cell instead of searching text: a label "
+             "(replaces the cell to its right) or 'ROW,COL' coordinates",
+    )
+    edit_p.add_argument(
+        "--col", type=int,
+        help="With --cell label, the 0-based column to replace "
+             "(default: the column right of the label)",
+    )
+    edit_p.add_argument(
+        "--table", type=int, default=None,
+        help="Which table in the body to address with --cell (0-based). "
+             "Coordinates default to the first table; a label searches all "
+             "tables unless this is set.",
     )
     edit_p.add_argument(
         "--quiet", action="store_true", help="Skip pre-flight checks"

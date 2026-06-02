@@ -1,11 +1,12 @@
 """Google Docs API v1 wrapper functions with error translation."""
 
+import re
 from functools import lru_cache
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from gdoc.util import AuthError, GdocError
+from gdoc.util import AuthError, GdocError, fold_typography
 
 
 @lru_cache(maxsize=1)
@@ -191,73 +192,252 @@ def get_document(doc_id: str) -> dict:
         _translate_http_error(e, doc_id)
 
 
+def _collect_segments(content: list[dict]) -> list[list[tuple[int, str]]]:
+    """Group (doc_index, char) pairs into independently-searchable segments.
+
+    Paragraph text at one level forms a single segment; each table cell is
+    its own segment (recursively, for nested tables). Searching per segment
+    means a match can never span a table-cell boundary \u2014 the Docs API can't
+    delete a range that crosses cells or removes a cell's final paragraph
+    mark, so such a match would produce an invalid edit.
+    """
+    segments: list[list[tuple[int, str]]] = []
+    root: list[tuple[int, str]] = []
+    for element in content:
+        paragraph = element.get("paragraph")
+        if paragraph is not None:
+            for pe in paragraph.get("elements", []):
+                text_run = pe.get("textRun")
+                if text_run is None:
+                    continue
+                run = text_run.get("content", "")
+                start_idx = pe.get("startIndex", 0)
+                for i, ch in enumerate(run):
+                    root.append((start_idx + i, ch))
+            continue
+        table = element.get("table")
+        if table is not None:
+            for row in table.get("tableRows", []):
+                for cell in row.get("tableCells", []):
+                    segments.extend(_collect_segments(cell.get("content", [])))
+    if root:
+        segments.append(root)
+    return segments
+
+
 def find_text_in_document(
     document: dict | None,
     text: str,
     match_case: bool = False,
     body: dict | None = None,
+    normalize: bool = False,
 ) -> list[dict]:
     """Find all occurrences of text within the document body.
 
-    Walks body.content → paragraph.elements → textRun.content to
-    build a concatenated string with position mapping, then searches.
+    Searches body.content per segment (top-level paragraphs, and each table
+    cell on its own) so a match never crosses a table-cell boundary.
 
     Args:
         document: The full document dict (used if body is None).
         text: Text to search for.
         match_case: If True, case-sensitive matching.
         body: Optional body dict to search in (e.g. from a specific tab).
+        normalize: If True, fold smart quotes/dashes to ASCII on both sides
+            before matching. The fold is length-preserving, so returned
+            indices stay correct.
 
     Returns list of {"startIndex": int, "endIndex": int} in document
-    coordinates.
+    coordinates, ordered by startIndex.
     """
-    # Build a mapping: (doc_index, char) for each character in the document
-    chars: list[tuple[int, str]] = []
-
     if body is None:
         if document is None:
             return []
         body = document.get("body", {})
-    for element in body.get("content", []):
-        paragraph = element.get("paragraph")
-        if paragraph is None:
-            continue
-        for pe in paragraph.get("elements", []):
-            text_run = pe.get("textRun")
-            if text_run is None:
-                continue
-            content = text_run.get("content", "")
-            start_idx = pe.get("startIndex", 0)
-            for i, ch in enumerate(content):
-                chars.append((start_idx + i, ch))
-
-    if not chars:
-        return []
-
-    # Build the concatenated text and index map
-    concat = "".join(ch for _, ch in chars)
-    doc_indices = [idx for idx, _ in chars]
-
-    search_text = text
-    search_in = concat
-    if not match_case:
-        search_text = text.lower()
-        search_in = concat.lower()
 
     matches = []
-    start = 0
-    while True:
-        pos = search_in.find(search_text, start)
-        if pos == -1:
-            break
-        end_pos = pos + len(search_text)
-        matches.append({
-            "startIndex": doc_indices[pos],
-            "endIndex": doc_indices[end_pos - 1] + 1,
-        })
-        start = pos + 1
+    for chars in _collect_segments(body.get("content", [])):
+        concat = "".join(ch for _, ch in chars)
+        doc_indices = [idx for idx, _ in chars]
 
+        search_text = text
+        search_in = concat
+        if normalize:
+            search_text = fold_typography(search_text)
+            search_in = fold_typography(search_in)
+        if not match_case:
+            search_text = search_text.lower()
+            search_in = search_in.lower()
+        if not search_text:
+            continue
+
+        start = 0
+        while True:
+            pos = search_in.find(search_text, start)
+            if pos == -1:
+                break
+            end_pos = pos + len(search_text)
+            matches.append({
+                "startIndex": doc_indices[pos],
+                "endIndex": doc_indices[end_pos - 1] + 1,
+            })
+            start = pos + 1
+
+    matches.sort(key=lambda m: m["startIndex"])
     return matches
+
+
+def diagnose_no_match(
+    document: dict | None,
+    text: str,
+    match_case: bool = False,
+    body: dict | None = None,
+    already_normalized: bool = False,
+) -> str | None:
+    """Explain why an exact search for `text` found nothing.
+
+    Returns a human-readable reason (to append to "no match found") or None
+    if no near-match can explain the miss. Runs entirely on the already-
+    fetched document \u2014 no extra API calls.
+    """
+    # Near-match that differs only in quote/dash style.
+    if not already_normalized and find_text_in_document(
+        document, text, match_case=match_case, body=body, normalize=True,
+    ):
+        return (
+            "but a near-match exists with different quote/dash style "
+            "(e.g. \u2019 vs '). Re-run with --normalize to match it"
+        )
+
+    # Near-match that differs only in whitespace (line breaks, runs of
+    # spaces, non-breaking spaces). Folded so quote style doesn't mask it.
+    if body is None and document is not None:
+        body = document.get("body", {})
+    segments = _collect_segments((body or {}).get("content", []))
+    concat = fold_typography(
+        "\n".join("".join(c for _, c in seg) for seg in segments)
+    )
+    needle = fold_typography(text)
+
+    def collapse(s: str) -> str:
+        return re.sub(r"\s+", " ", s).strip()
+
+    hay_c, needle_c = collapse(concat), collapse(needle)
+    if not match_case:
+        hay_c, needle_c = hay_c.lower(), needle_c.lower()
+    if needle_c and needle_c in hay_c:
+        return (
+            "but the text appears with different whitespace (line breaks "
+            "or non-breaking spaces). Adjust the anchor to match exactly"
+        )
+
+    return None
+
+
+_COORD_RE = re.compile(r"^\s*(\d+)\s*,\s*(\d+)\s*$")
+
+
+def _parse_coord(spec: str) -> tuple[int, int] | None:
+    """Parse 'R,C' into (row, col) ints, or None if not coordinate form."""
+    m = _COORD_RE.match(spec)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return None
+
+
+def _cell_text_range(cell: dict) -> dict | None:
+    """Editable text range of a table cell as {startIndex, endIndex}.
+
+    Spans the cell's text but excludes the final structural paragraph mark
+    (the Docs API forbids deleting a cell's last newline). An empty cell
+    yields a zero-width range → pure insert. Returns None if no paragraph
+    element with an index can be located.
+    """
+    first_start: int | None = None
+    last_start: int | None = None
+    last_content = ""
+    for element in cell.get("content", []):
+        para = element.get("paragraph")
+        if para is None:
+            continue
+        for pe in para.get("elements", []):
+            start = pe.get("startIndex")
+            if start is None:
+                continue
+            if first_start is None:
+                first_start = start
+            tr = pe.get("textRun")
+            last_start = start
+            last_content = tr.get("content", "") if tr else ""
+    if first_start is None:
+        content = cell.get("content", [])
+        fs = content[0].get("startIndex") if content else None
+        return {"startIndex": fs, "endIndex": fs} if fs is not None else None
+    end = last_start + len(last_content)
+    if last_content.endswith("\n"):
+        end -= 1  # keep the cell's final paragraph mark
+    if end < first_start:
+        end = first_start
+    return {"startIndex": first_start, "endIndex": end}
+
+
+def resolve_cell_range(
+    body: dict,
+    cell: str,
+    col: int | None = None,
+    table_index: int | None = None,
+    normalize: bool = False,
+) -> dict | None:
+    """Resolve a cell address to an editable {startIndex, endIndex} range.
+
+    Two forms, auto-detected:
+    - coordinate ('R,C'): row R, column C of a table (0-based). Uses table
+      `table_index`, or the first table when `table_index` is None.
+    - label (anything else): find the first row cell whose text equals
+      `cell`; the target is column `col` if given, else the cell to its
+      right. Searches every table by default, or only table `table_index`
+      when one is given.
+
+    `normalize` folds smart quotes/dashes when comparing labels. Returns
+    None if nothing resolves.
+    """
+    tables = [el["table"] for el in body.get("content", []) if "table" in el]
+
+    coord = _parse_coord(cell)
+    if coord is not None:
+        r, c = coord
+        ti = 0 if table_index is None else table_index
+        if not 0 <= ti < len(tables):
+            return None
+        rows = tables[ti].get("tableRows", [])
+        if not 0 <= r < len(rows):
+            return None
+        cells = rows[r].get("tableCells", [])
+        if not 0 <= c < len(cells):
+            return None
+        return _cell_text_range(cells[c])
+
+    # Label mode: honor an explicit --table; otherwise scan all tables.
+    if table_index is None:
+        search_tables = tables
+    elif 0 <= table_index < len(tables):
+        search_tables = [tables[table_index]]
+    else:
+        return None
+
+    target = fold_typography(cell) if normalize else cell
+    target = target.strip()
+    for table in search_tables:
+        for row in table.get("tableRows", []):
+            cells = row.get("tableCells", [])
+            for ci, c_ in enumerate(cells):
+                label = _extract_paragraphs_text(c_.get("content", []))
+                label = (fold_typography(label) if normalize else label).strip()
+                if label == target:
+                    target_col = col if col is not None else ci + 1
+                    if not 0 <= target_col < len(cells):
+                        return None
+                    return _cell_text_range(cells[target_col])
+    return None
 
 
 def _find_table_cell_indices(
@@ -623,7 +803,7 @@ def _build_cleanup_requests(
 ) -> list[dict]:
     """Build batchUpdate requests to clean up an empty heading paragraph.
 
-    Pure function — inspects body content and returns request dicts
+    Pure function \u2014 inspects body content and returns request dicts
     without making API calls. When the deleted text was the entire
     content of a heading paragraph, an empty "\\n" with the heading
     style remains. This returns requests that transfer that style to
@@ -751,7 +931,7 @@ def insert_markdown_into_tab(
 
     parsed = parse_markdown(markdown)
 
-    # Strip trailing \n — the existing paragraph already owns one.
+    # Strip trailing \n \u2014 the existing paragraph already owns one.
     # Without this, every insert leaves an extra blank line behind.
     if parsed.plain_text.endswith("\n"):
         old_len = len(parsed.plain_text)
@@ -830,7 +1010,7 @@ def replace_formatted(
 
     parsed = parse_markdown(new_markdown)
 
-    # Strip trailing \n — the existing paragraph in the document
+    # Strip trailing \n \u2014 the existing paragraph in the document
     # already has one.  Without this, every replacement inserts an
     # extra paragraph break.
     if parsed.plain_text.endswith("\n"):
@@ -848,7 +1028,7 @@ def replace_formatted(
     all_requests: list[dict] = []
 
     for match in sorted_matches:
-        # Delete the matched range (skip empty ranges — Docs API rejects
+        # Delete the matched range (skip empty ranges \u2014 Docs API rejects
         # them with "The range should not be empty", and a zero-width
         # match is a pure insert).
         if match["endIndex"] > match["startIndex"]:
