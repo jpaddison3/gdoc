@@ -191,6 +191,18 @@ gdoc cat 1aBcDeFg...
 | `new TITLE` | Create a blank document (`--folder` to specify location, `--file` to import markdown with images) |
 | `cp DOC TITLE` | Duplicate a document |
 
+### Revisions & diffs
+
+| Command | Description |
+|---------|-------------|
+| `revisions DOC` | List retained revisions — id, modified time, author, `[keep]` marker (`--limit N`; alias: `history`) |
+| `cat --revision REV DOC` | Export a past revision to stdout |
+| `pull --revision REV DOC FILE` | Download a past revision (gets `source:`/`revision:` frontmatter, not `gdoc:`, so it can't be pushed back by accident) |
+| `diff DOC FILE` | Compare the current doc against a local file (unified diff) |
+| `diff DOC --rev A..B` | Word-diff two revisions (`--rev A` compares A against latest) |
+| `diff DOC --since ISO` | What changed since a timestamp (last revision at/before it vs latest) |
+| `diff DOC --rev A..B --format html\|docx` | Write a styled diff artifact (`--out PATH`, `--with-comments` to anchor comment threads) |
+
 ### Comments
 
 | Command | Description |
@@ -309,6 +321,37 @@ the Sheets API, so no re-authentication is needed.
 ```
 
 Comments whose anchor text has been deleted, is too short, or is ambiguous are grouped in an `[UNANCHORED]` section at the end.
+
+## Revision history & diffs
+
+Google Docs' "Version history" UI has no public API, but the Drive API exposes **milestone revisions** for native Docs, and each one is exportable. Two caveats baked into the tooling: revision ids are **sparse** (1, 3, 7, 20, …), and non-pinned revisions are **pruned by Google over time** — so `gdoc revisions` is the starting point, and a pruned revision produces a clear error pointing back to it.
+
+```bash
+# List retained revisions (oldest first; [keep] = pinned forever)
+gdoc revisions DOC_ID
+
+# What changed in the most recent edit?
+gdoc diff DOC_ID --rev prev
+
+# What changed since I last read it?
+gdoc diff DOC_ID --since 2026-06-10T19:00:00Z
+
+# Compare two specific revisions, chunkier word-diff
+gdoc diff DOC_ID --rev 69..190 --min-common 30
+
+# Styled artifact with the doc's comment threads anchored inline
+gdoc diff DOC_ID --rev 69..190 --format html --with-comments --out review.html
+
+# Read or download a past revision
+gdoc cat DOC_ID --revision head~2
+gdoc pull DOC_ID old-draft.md --revision @2026-06-01
+```
+
+**REV selectors** (shared by `cat`, `pull`, and `diff`): a bare revision id (`190`), `latest`/`head`, `prev`, `head~N` (N back from latest by list position), or `@ISO` (last revision at/before the timestamp; naive timestamps are local time).
+
+Revision diffs print a colored word-diff to a TTY (plain text when piped; `--format` overrides). Rewritten sentences render as one contiguous removed/added chunk rather than word salad — shared scraps shorter than `--min-common` characters (default 24) are absorbed into the change. `--context N` controls how many unchanged blocks are kept around each change; the rest collapse to `⋯ N unchanged ⋯` (headings always stay). `--json` emits a stable diff model (`doc`/`old`/`new`/`hunks`, each hunk a list of `equal|del|ins` runs, plus `comments` with their anchored hunk index when `--with-comments` is set). Exit code follows `diff DOC FILE`: 1 when the revisions differ, 0 when identical.
+
+`--format docx` needs the optional `python-docx` dependency (`pip install 'gdoc[docx]'` or `uv tool install 'gdoc[docx]'`); HTML output has no extra dependencies.
 
 ## Tabs
 
