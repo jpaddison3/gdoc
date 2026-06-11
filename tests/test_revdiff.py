@@ -308,6 +308,26 @@ class TestAttachComments:
         [comment] = attach_comments(hunks, [_comment("c1", "no such anchor")])
         assert comment["hunk"] is None
 
+    def test_split_marker_pair_anchors_to_current_side(self):
+        # A marker-only change is a delete+insert pair with identical
+        # text; the comment belongs on the current (insert) side
+        hunks = build_hunks(
+            "## Same heading text here\n", "### Same heading text here\n",
+        )
+        [comment] = attach_comments(
+            hunks, [_comment("c1", "Same heading text here")],
+        )
+        assert hunks[comment["hunk"]]["kind"] == "insert"
+
+    def test_deleted_text_anchors_to_delete_hunk(self):
+        old = "Stable paragraph one.\n\nGone forever sentence here.\n"
+        new = "Stable paragraph one.\n"
+        hunks = build_hunks(old, new)
+        [comment] = attach_comments(
+            hunks, [_comment("c1", "Gone forever sentence")],
+        )
+        assert hunks[comment["hunk"]]["kind"] == "delete"
+
     def test_no_match_across_replace_junction(self):
         # The anchor spans the end of the old side and the start of the
         # new side; neither side alone contains it.

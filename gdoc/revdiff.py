@@ -483,13 +483,29 @@ def attach_comments(hunks: list[dict], comments: list[dict]) -> list[dict]:
             and len(anchor) >= _ANCHOR_MIN_LEN
             and anchor not in _ANCHOR_STOPWORDS
         ):
+            # Preference ladder: a changed hunk whose *new* side holds
+            # the anchor (the current content under discussion), then a
+            # changed hunk matching only its old side (quoted text that
+            # was deleted), then the first match anywhere. Matters for
+            # split delete+insert pairs, which share the same text.
+            old_changed = None
+            first_match = None
             for idx, (old_side, new_side) in enumerate(match_texts):
-                if key in old_side or key in new_side:
-                    if hunk_changed(hunks[idx]):
+                in_new = key in new_side
+                if not in_new and key not in old_side:
+                    continue
+                if first_match is None:
+                    first_match = idx
+                if hunk_changed(hunks[idx]):
+                    if in_new:
                         target = idx
                         break
-                    if target is None:
-                        target = idx
+                    if old_changed is None:
+                        old_changed = idx
+            if target is None:
+                target = (
+                    old_changed if old_changed is not None else first_match
+                )
         replies = [
             {
                 "author": (r.get("author") or {}).get("displayName", "?"),
