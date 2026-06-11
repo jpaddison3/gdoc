@@ -158,18 +158,6 @@ class TestRevOutput:
         assert f"OK wrote {out_path}" in capsys.readouterr().out
 
     @_patches
-    def test_docx_artifact(
-        self, _pf, _list, _export, _info, _update, capsys, tmp_path,
-    ):
-        docx = pytest.importorskip("docx")
-        out_path = tmp_path / "diff.docx"
-        rc = cmd_diff(_make_args(rev="1..20", out=str(out_path)))
-        assert rc == 1
-        document = docx.Document(str(out_path))
-        text = "\n".join(p.text for p in document.paragraphs)
-        assert "My Doc — revision diff" in text
-
-    @_patches
     def test_with_comments_in_json(
         self, _pf, _list, _export, _info, _update, capsys,
     ):
@@ -223,11 +211,10 @@ class TestRevOutput:
         assert out_path.exists()
 
     @_patches
-    def test_docx_write_error_exits_3(
+    def test_artifact_write_error_exits_3(
         self, _pf, _list, _export, _info, _update, tmp_path,
     ):
-        pytest.importorskip("docx")
-        out_path = tmp_path / "no-such-dir" / "diff.docx"
+        out_path = tmp_path / "no-such-dir" / "diff.html"
         with pytest.raises(GdocError, match="cannot write file") as exc_info:
             cmd_diff(_make_args(rev="1..20", out=str(out_path)))
         assert exc_info.value.exit_code == 3
@@ -272,11 +259,6 @@ class TestRevValidation:
     def test_plain_flag_with_color_format(self):
         with pytest.raises(GdocError, match="mutually exclusive") as exc_info:
             cmd_diff(_make_args(rev="1..20", plain=True, format="color"))
-        assert exc_info.value.exit_code == 3
-
-    def test_format_contradicts_out_extension(self):
-        with pytest.raises(GdocError, match="contradicts") as exc_info:
-            cmd_diff(_make_args(rev="1..20", format="html", out="x.docx"))
         assert exc_info.value.exit_code == 3
 
     def test_with_comments_requires_rich_format(self):

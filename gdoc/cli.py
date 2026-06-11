@@ -1716,36 +1716,27 @@ def _resolve_diff_format(args) -> str:
     if fmt == "auto" and out:
         if out.endswith(".html"):
             fmt = "html"
-        elif out.endswith(".docx"):
-            fmt = "docx"
         else:
             raise GdocError(
-                f"cannot infer format from {out!r} (expected .html or "
-                ".docx); pass --format",
+                f"cannot infer format from {out!r} (expected .html); "
+                "pass --format",
                 exit_code=3,
             )
-    if out and fmt in ("html", "docx"):
-        other = {"html": ".docx", "docx": ".html"}[fmt]
-        if out.endswith(other):
-            raise GdocError(
-                f"--format {fmt} contradicts output path {out!r}",
-                exit_code=3,
-            )
-    # --json composes with the artifact formats (JSON write
-    # confirmation on stdout) but not with the terminal formats
+    # --json composes with the html artifact (JSON write confirmation
+    # on stdout) but not with the terminal formats
     if mode == "json" and fmt in ("color", "plain"):
         raise GdocError(
             f"--json and --format {fmt} are mutually exclusive",
             exit_code=3,
         )
-    if mode == "plain" and fmt not in ("auto", "plain", "html", "docx"):
+    if mode == "plain" and fmt == "color":
         raise GdocError(
-            f"--plain and --format {fmt} are mutually exclusive",
+            "--plain and --format color are mutually exclusive",
             exit_code=3,
         )
-    if out and fmt not in ("html", "docx"):
+    if out and fmt != "html":
         raise GdocError(
-            "--out requires --format html or docx "
+            "--out requires --format html "
             "(redirect stdout for text formats)",
             exit_code=3,
         )
@@ -1769,7 +1760,7 @@ def _diff_revisions(args, doc_id: str) -> int:
     fmt = _resolve_diff_format(args)
     if with_comments and fmt in ("color", "plain"):
         raise GdocError(
-            "--with-comments requires --format html, docx, or json "
+            "--with-comments requires --format html or json "
             "(the terminal renderer does not show comments)",
             exit_code=3,
         )
@@ -1834,26 +1825,12 @@ def _diff_revisions(args, doc_id: str) -> int:
 
     if fmt == "json":
         print(format_json(identical=changed == 0, **model))
-    elif fmt in ("html", "docx"):
-        out_path = getattr(args, "out", None) or f"gdoc-diff.{fmt}"
-        if fmt == "docx":
-            try:
-                import docx  # noqa: F401
-            except ImportError:
-                raise GdocError(
-                    "--format docx requires python-docx. Install it "
-                    "with `pip install python-docx` (or install gdoc "
-                    "with the [docx] extra).",
-                    exit_code=3,
-                )
+    elif fmt == "html":
+        out_path = getattr(args, "out", None) or "gdoc-diff.html"
+        from gdoc.diffrender import render_html
         try:
-            if fmt == "html":
-                from gdoc.diffrender import render_html
-                with open(out_path, "w") as f:
-                    f.write(render_html(model, context=context))
-            else:
-                from gdoc.diffdocx import render_docx
-                render_docx(model, out_path, context=context)
+            with open(out_path, "w") as f:
+                f.write(render_html(model, context=context))
         except OSError as e:
             raise GdocError(f"cannot write file: {e}", exit_code=3)
 
@@ -3022,19 +2999,18 @@ def build_parser() -> GdocArgumentParser:
     )
     diff_p.add_argument(
         "--format",
-        choices=["auto", "color", "plain", "json", "html", "docx"],
+        choices=["auto", "color", "plain", "json", "html"],
         default="auto",
         help="Revision-diff renderer (default: color on a TTY, else "
-             "plain; html/docx write a styled artifact)",
+             "plain; html writes a styled artifact)",
     )
     diff_p.add_argument(
         "--out", metavar="PATH",
-        help="Output path for --format html/docx "
-             "(default: gdoc-diff.<ext>)",
+        help="Output path for --format html (default: gdoc-diff.html)",
     )
     diff_p.add_argument(
         "--with-comments", action="store_true",
-        help="Anchor the doc's comment threads into html/docx/json "
+        help="Anchor the doc's comment threads into html/json "
              "revision diffs",
     )
     diff_p.add_argument(

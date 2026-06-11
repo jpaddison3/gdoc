@@ -26,16 +26,16 @@ All notable changes to `gdoc` are documented here. This project follows
   chars (default 24) are absorbed so a rewritten sentence renders as
   one removed chunk + one added chunk, not word salad. Colored
   word-diff on a TTY, plain `[-…-]`/`{+…+}` text when piped, `--json`
-  for a stable documented diff model, and `--format html|docx --out F`
-  for styled review artifacts (GitHub-style colors, collapsed
+  for a stable documented diff model, and `--format html --out F`
+  for a styled review artifact (GitHub-style colors, collapsed
   unchanged runs, `--context N`). Existing `diff DOC FILE` behavior
   is unchanged.
 - **`gdoc diff --with-comments`** — pull the doc's comment threads and
   anchor each to the diff hunk containing its quoted text (changed
   hunks preferred); threads whose anchor isn't visible render in an
-  "Other comment threads" appendix. Color-coded by author in html/docx.
-- **`gdoc[docx]` extra** — `python-docx` is only required for
-  `--format docx`; HTML output is dependency-free.
+  "Other comment threads" appendix. Color-coded by author in html.
+- Richer artifacts (docx, PDF, …) are deliberately not built in —
+  external scripts render them from the `--json` diff model.
 
 ### Changed
 - A pruned or unknown revision produces a clear exit-3 error pointing

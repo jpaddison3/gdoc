@@ -1,7 +1,8 @@
 """Revision diff engine: REV selectors, block alignment, coalescing word-diff.
 
-One diff model, many renderers (gdoc.diffrender for terminal/HTML,
-gdoc.diffdocx for .docx). The model is the documented `gdoc diff --json`
+One diff model, many renderers (gdoc.diffrender for terminal/HTML;
+richer artifacts like docx are built by external scripts from the
+`--json` output). The model is the documented `gdoc diff --json`
 schema::
 
     {

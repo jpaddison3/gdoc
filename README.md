@@ -201,7 +201,7 @@ gdoc cat 1aBcDeFg...
 | `diff DOC FILE` | Compare the current doc against a local file (unified diff) |
 | `diff DOC --rev A..B` | Word-diff two revisions (`--rev A` compares A against latest) |
 | `diff DOC --since ISO` | What changed since a timestamp (last revision at/before it vs latest) |
-| `diff DOC --rev A..B --format html\|docx` | Write a styled diff artifact (`--out PATH`, `--with-comments` to anchor comment threads) |
+| `diff DOC --rev A..B --format html` | Write a styled diff artifact (`--out PATH`, `--with-comments` to anchor comment threads) |
 
 ### Comments
 
@@ -349,11 +349,11 @@ gdoc pull DOC_ID old-draft.md --revision @2026-06-01
 
 **REV selectors** (shared by `cat`, `pull`, and `diff`): a bare revision id (`190`), `latest`/`head`, `prev`, `head~N` (N back from latest by list position), or `@ISO` (last revision at/before the timestamp; naive timestamps are local time).
 
-Revision diffs print a colored word-diff to a TTY (plain text when piped; `--format` overrides). Rewritten sentences render as one contiguous removed/added chunk rather than word salad — shared scraps shorter than `--min-common` characters (default 24) are absorbed into the change. `--context N` controls how many unchanged blocks are kept around each change; the rest collapse to `⋯ N unchanged ⋯` (headings always stay). `--json` emits the documented diff model (`doc`/`old`/`new`/`hunks`, each hunk a list of `equal|del|ins` runs, plus `comments` with their anchored hunk index when `--with-comments` is set) wrapped with top-level `ok` and `identical` keys; combined with `--format html/docx` it instead prints a JSON write confirmation (`path`, `format`, `changed`, `identical`). Exit code follows `diff DOC FILE`: 1 when the revisions differ, 0 when identical.
+Revision diffs print a colored word-diff to a TTY (plain text when piped; `--format` overrides). Rewritten sentences render as one contiguous removed/added chunk rather than word salad — shared scraps shorter than `--min-common` characters (default 24) are absorbed into the change. `--context N` controls how many unchanged blocks are kept around each change; the rest collapse to `⋯ N unchanged ⋯` (headings always stay). `--json` emits the documented diff model (`doc`/`old`/`new`/`hunks`, each hunk a list of `equal|del|ins` runs, plus `comments` with their anchored hunk index when `--with-comments` is set) wrapped with top-level `ok` and `identical` keys; combined with `--format html` it instead prints a JSON write confirmation (`path`, `format`, `changed`, `identical`). Exit code follows `diff DOC FILE`: 1 when the revisions differ, 0 when identical.
 
 The diff model is display-oriented, not a faithful character diff: export escaping and whitespace are normalized, images become `⟦diagram⟧` placeholders, ordered-list renumbering alone doesn't register as a change, and coalescing relabels short unchanged spans as part of the surrounding change (pass `--min-common 0` for the uncoalesced word diff). The engine also parses Google's current markdown-export conventions (one line per paragraph, `![][imageN]` references) — like revision pruning, this is undocumented Google behavior that may change.
 
-`--format docx` needs the optional `python-docx` dependency (`pip install 'gdoc[docx]'` or `uv tool install 'gdoc[docx]'`); HTML output has no extra dependencies.
+HTML output has no extra dependencies. Richer artifacts (docx, PDF, …) are deliberately not built in: `--json` emits the full diff model (including comment anchoring and list markers), and an external script or the calling agent renders it however it likes.
 
 ## Tabs
 

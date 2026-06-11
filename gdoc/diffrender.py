@@ -1,8 +1,7 @@
 """Terminal (color/plain) and HTML renderers for the revision-diff model.
 
-Also home to the view-selection helpers (`iter_visible`,
-`split_comments`, `short_time`, `clip_quoted`) shared with
-gdoc.diffdocx.
+Richer artifacts (docx, PDF, ...) are deliberately out of scope:
+external scripts build them from the `gdoc diff --json` model.
 """
 
 import html as html_mod
