@@ -13,7 +13,7 @@ from functools import lru_cache
 from googleapiclient.errors import HttpError
 
 from gdoc.api import get_drive_service
-from gdoc.revdiff import pruned_error as _pruned_error
+from gdoc.revdiff import pruned_error
 from gdoc.util import AuthError, GdocError
 
 _REVISION_FIELDS = (
@@ -21,7 +21,7 @@ _REVISION_FIELDS = (
     "lastModifyingUser(displayName, emailAddress), exportLinks"
 )
 
-_EXPORT_TIMEOUT = 30  # seconds, matches gdoc.auth
+_EXPORT_TIMEOUT = 30  # seconds
 
 
 def _translate_http_error(e: HttpError, file_id: str) -> None:
@@ -115,7 +115,7 @@ def export_revision(
             export_links = result.get("exportLinks", {})
         except HttpError as e:
             if int(e.resp.status) == 404:
-                raise _pruned_error(revision_id)
+                raise pruned_error(revision_id)
             _translate_http_error(e, file_id)
 
     url = export_links.get(mime_type)
@@ -134,7 +134,7 @@ def export_revision(
 
     response = _get_session().get(url, timeout=_EXPORT_TIMEOUT)
     if response.status_code == 404:
-        raise _pruned_error(revision_id)
+        raise pruned_error(revision_id)
     if response.status_code == 401:
         raise AuthError("Authentication expired. Run `gdoc auth`.")
     if response.status_code == 403:

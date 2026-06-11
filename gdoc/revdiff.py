@@ -35,13 +35,12 @@ import html
 import re
 from datetime import datetime
 
+from gdoc.mdimport import IMAGE_DEF_RE, IMAGE_REF_RE
 from gdoc.util import GdocError
 
 DEFAULT_MIN_COMMON = 24
 DEFAULT_CONTEXT = 2
 
-_IMAGE_REF = re.compile(r"!\[\]\[image\d+\]")
-_IMAGE_DEF = re.compile(r"^\s*\[image\d+\]\s*:")
 _HEADING_MARK = r"#{1,6}"
 _BULLET_MARK = r"\\?[*\-]"
 _ORDERED_MARK = r"\d+[.)\\]+"
@@ -175,7 +174,7 @@ def clean_text(s: str) -> str:
     marker, replace image refs with a placeholder, and collapse spaces.
     """
     s = html.unescape(s)
-    s = _IMAGE_REF.sub("⟦diagram⟧", s)
+    s = IMAGE_REF_RE.sub("⟦diagram⟧", s)
     for _ in range(3):  # loop handles double-escapes
         unescaped = re.sub(r"\\([^\w\s])", r"\1", s)
         if unescaped == s:
@@ -210,7 +209,7 @@ def load_blocks(text: str) -> list[str]:
     """
     blocks = []
     for raw in text.splitlines():
-        if _IMAGE_DEF.match(raw) or raw.lstrip().startswith(
+        if IMAGE_DEF_RE.match(raw) or raw.lstrip().startswith(
             ("data:image", "<data:image"),
         ):
             continue
@@ -315,9 +314,20 @@ def _make_hunk(
     )
     if kind in ("equal", "replace"):
         # Alignment pairs blocks loosely (case-insensitive), so a pair
-        # can arrive here either way; the final kind depends on the
-        # cleaned text a reader actually sees.
-        kind = "equal" if old_text == new_text else "replace"
+        # can arrive here either way; the final kind depends on what a
+        # reader actually sees: the cleaned text plus the block
+        # structure (so a heading-level or paragraph→bullet change is
+        # a diff, while ordered-list renumbering is not).
+        same_structure = (
+            old_block is not None
+            and new_block is not None
+            and classify_block(old_block) == classify_block(new_block)
+            and heading_level(old_block) == heading_level(new_block)
+        )
+        kind = (
+            "equal" if old_text == new_text and same_structure
+            else "replace"
+        )
     hunk: dict = {"kind": kind, "block_type": block_type}
     if block_type == "heading":
         hunk["level"] = heading_level(src)

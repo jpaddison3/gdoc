@@ -53,12 +53,14 @@ def add_frontmatter(body: str, metadata: dict) -> str:
     Returns:
         Content with frontmatter prepended.
 
-    Values are flattened to a single line: a newline in a value (e.g. a
-    doc title) would otherwise inject arbitrary frontmatter keys.
+    Values are flattened to a single line: a line break in a value
+    (e.g. a doc title) would otherwise inject arbitrary frontmatter
+    keys. splitlines() covers the same separator set parse_frontmatter
+    splits on (\\n, \\r, \\x0b, \\u2028, ...), unlike a [\\r\\n] regex.
     """
     lines = ["---"]
     for key, value in metadata.items():
-        value = re.sub(r"[\r\n]+", " ", str(value))
+        value = " ".join(str(value).splitlines())
         lines.append(f"{key}: {value}")
     lines.append("---")
     lines.append("")

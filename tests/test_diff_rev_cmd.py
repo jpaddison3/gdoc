@@ -258,6 +258,12 @@ class TestRevValidation:
             cmd_diff(_make_args(rev="1..20", json=True, format="color"))
         assert exc_info.value.exit_code == 3
 
+    def test_json_flag_with_inferred_artifact_blames_out(self):
+        # format came from --out, so the error must not name --format
+        with pytest.raises(GdocError, match=r"--out") as exc_info:
+            cmd_diff(_make_args(rev="1..20", json=True, out="x.html"))
+        assert exc_info.value.exit_code == 3
+
     def test_plain_flag_with_color_format(self):
         with pytest.raises(GdocError, match="mutually exclusive") as exc_info:
             cmd_diff(_make_args(rev="1..20", plain=True, format="color"))

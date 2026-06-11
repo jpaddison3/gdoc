@@ -1492,7 +1492,9 @@ def cmd_push(args) -> int:
 
     metadata, body = parse_frontmatter(content)
     if "gdoc" not in metadata:
-        if "revision" in metadata or "source" in metadata:
+        # pull --revision writes both keys; requiring both avoids
+        # false positives on unrelated files with a `source:` key
+        if "revision" in metadata and "source" in metadata:
             raise GdocError(
                 "this file was pulled from a past revision and is not "
                 "pushable (it would overwrite the live doc with stale "
@@ -1711,6 +1713,7 @@ def _resolve_diff_format(args) -> str:
     out = getattr(args, "out", None)
     mode = get_output_mode(args)
 
+    inferred = False
     if fmt == "auto" and out:
         if out.endswith(".html"):
             fmt = "html"
@@ -1722,6 +1725,7 @@ def _resolve_diff_format(args) -> str:
                 ".docx); pass --format",
                 exit_code=3,
             )
+        inferred = True
     if out and fmt in ("html", "docx"):
         other = {"html": ".docx", "docx": ".html"}[fmt]
         if out.endswith(other):
@@ -1730,6 +1734,13 @@ def _resolve_diff_format(args) -> str:
                 exit_code=3,
             )
     if mode == "json" and fmt not in ("auto", "json"):
+        if inferred:
+            # The user never passed --format; don't blame it
+            raise GdocError(
+                f"--json cannot be combined with an {fmt} artifact "
+                f"(--out {out})",
+                exit_code=3,
+            )
         raise GdocError(
             f"--json and --format {fmt} are mutually exclusive",
             exit_code=3,
@@ -1832,14 +1843,7 @@ def _diff_revisions(args, doc_id: str) -> int:
         print(format_json(identical=changed == 0, **model))
     elif fmt in ("html", "docx"):
         out_path = getattr(args, "out", None) or f"gdoc-diff.{fmt}"
-        if fmt == "html":
-            from gdoc.diffrender import render_html
-            try:
-                with open(out_path, "w") as f:
-                    f.write(render_html(model, context=context))
-            except OSError as e:
-                raise GdocError(f"cannot write file: {e}", exit_code=3)
-        else:
+        if fmt == "docx":
             try:
                 import docx  # noqa: F401
             except ImportError:
@@ -1849,11 +1853,16 @@ def _diff_revisions(args, doc_id: str) -> int:
                     "with the [docx] extra).",
                     exit_code=3,
                 )
-            from gdoc.diffdocx import render_docx
-            try:
+        try:
+            if fmt == "html":
+                from gdoc.diffrender import render_html
+                with open(out_path, "w") as f:
+                    f.write(render_html(model, context=context))
+            else:
+                from gdoc.diffdocx import render_docx
                 render_docx(model, out_path, context=context)
-            except OSError as e:
-                raise GdocError(f"cannot write file: {e}", exit_code=3)
+        except OSError as e:
+            raise GdocError(f"cannot write file: {e}", exit_code=3)
 
         anchored = ""
         if "comments" in model:

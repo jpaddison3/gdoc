@@ -1,8 +1,8 @@
 """Terminal (color/plain) and HTML renderers for the revision-diff model.
 
-Also home to the view-selection helpers (`select_visible`,
-`iter_visible`, `split_comments`, `short_time`, `clip_quoted`) shared
-with gdoc.diffdocx.
+Also home to the view-selection helpers (`iter_visible`,
+`split_comments`, `short_time`, `clip_quoted`) shared with
+gdoc.diffdocx.
 """
 
 import html as html_mod

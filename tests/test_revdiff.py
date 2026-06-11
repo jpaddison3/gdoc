@@ -236,6 +236,26 @@ class TestBuildHunks:
         )
         assert [h["kind"] for h in hunks] == ["equal"]
 
+    def test_heading_level_change_is_a_diff(self):
+        hunks = build_hunks(
+            "## Same heading text here\n", "### Same heading text here\n",
+        )
+        assert [h["kind"] for h in hunks] == ["replace"]
+
+    def test_paragraph_to_bullet_is_a_diff(self):
+        hunks = build_hunks(
+            "The same sentence either way.\n",
+            "- The same sentence either way.\n",
+        )
+        assert [h["kind"] for h in hunks] == ["replace"]
+
+    def test_ordered_list_renumbering_stays_equal(self):
+        hunks = build_hunks(
+            "2\\. The same item text here.\n",
+            "3\\. The same item text here.\n",
+        )
+        assert [h["kind"] for h in hunks] == ["equal"]
+
 
 def _comment(cid, quoted, content="note", author="Alice",
              created="2026-06-09T00:00:00Z"):
