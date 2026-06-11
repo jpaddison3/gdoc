@@ -345,7 +345,7 @@ Exit codes: 0=success, 1=API error, 2=auth error, 3=usage error
 
 ## Dependencies
 
-```
+```text
 google-api-python-client    # Drive + Docs API
 google-auth-oauthlib        # OAuth2 flow
 google-auth-httplib2        # HTTP transport

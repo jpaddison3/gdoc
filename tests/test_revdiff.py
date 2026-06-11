@@ -122,7 +122,7 @@ class TestCleanText:
         assert clean_text("before ![][image3] after") == "before ⟦diagram⟧ after"
 
     def test_collapses_whitespace_and_nbsp(self):
-        assert clean_text("a  b\t\tc") == "a b c"
+        assert clean_text("a\u00a0 b\t\tc") == "a b c"
 
 
 class TestLoadBlocks:

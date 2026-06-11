@@ -115,7 +115,7 @@ def export_revision(
             export_links = result.get("exportLinks", {})
         except HttpError as e:
             if int(e.resp.status) == 404:
-                raise pruned_error(revision_id)
+                raise pruned_error(revision_id) from e
             _translate_http_error(e, file_id)
 
     url = export_links.get(mime_type)

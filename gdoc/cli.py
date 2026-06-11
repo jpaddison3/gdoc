@@ -1832,7 +1832,7 @@ def _diff_revisions(args, doc_id: str) -> int:
             with open(out_path, "w") as f:
                 f.write(render_html(model, context=context))
         except OSError as e:
-            raise GdocError(f"cannot write file: {e}", exit_code=3)
+            raise GdocError(f"cannot write file: {e}", exit_code=3) from e
 
         inline = None
         anchored = ""
