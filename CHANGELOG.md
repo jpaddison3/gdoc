@@ -42,6 +42,13 @@ All notable changes to `gdoc` are documented here. This project follows
   at `gdoc revisions` (Drive prunes non-pinned revisions over time).
 - `comments.list` now also requests reply `createdTime` (used by the
   diff comment rendering).
+- `requests` is now a declared dependency (it was already pulled in
+  transitively); revision exports use it directly via
+  `google.auth.transport.requests`.
+- `push` on a `pull --revision` file explains that revision pulls are
+  not pushable, instead of "no gdoc frontmatter found".
+- Frontmatter values are flattened to one line on write, so a doc
+  title containing a newline can't inject frontmatter keys.
 
 ## [0.10.2] — 2026-06-09
 

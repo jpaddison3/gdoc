@@ -40,12 +40,9 @@ def _model():
 class TestRenderDocx:
     def test_writes_parseable_file_with_diff_content(self, tmp_path):
         out = tmp_path / "diff.docx"
-        stats = render_docx(_model(), str(out))
+        render_docx(_model(), str(out))
 
         assert out.exists()
-        assert stats["comments_inline"] == 1
-        assert stats["comments_appendix"] == 0
-        assert stats["shown"] <= stats["hunks"]
 
         document = docx.Document(str(out))
         text = "\n".join(p.text for p in document.paragraphs)

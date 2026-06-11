@@ -12,7 +12,12 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
 
-from gdoc.diffrender import select_visible, short_time, split_comments
+from gdoc.diffrender import (
+    clip_quoted,
+    iter_visible,
+    short_time,
+    split_comments,
+)
 from gdoc.revdiff import DEFAULT_CONTEXT, hunk_side_text
 
 # GitHub-ish palette
@@ -189,13 +194,10 @@ class _DocxBuilder:
         if c.get("resolved"):
             _add_run(head, "   (resolved)", size=8.5, color=CTX, italic=True)
         if c.get("quoted"):
-            quoted = c["quoted"]
-            if len(quoted) > 90:
-                quoted = quoted[:90] + "…"
             p = cell.add_paragraph()
             p.paragraph_format.space_after = Pt(2)
-            _add_run(p, "on: “" + quoted + "”", italic=True, size=8.5,
-                     color=CTX)
+            _add_run(p, "on: “" + clip_quoted(c["quoted"]) + "”",
+                     italic=True, size=8.5, color=CTX)
         p = cell.add_paragraph()
         p.paragraph_format.space_after = Pt(2)
         _add_run(p, c["content"], size=9.5)
@@ -267,9 +269,6 @@ class _DocxBuilder:
         hunks = model["hunks"]
         comments = model.get("comments", [])
         by_hunk, appendix = split_comments(comments)
-        keep = select_visible(
-            hunks, self.context, comment_hunks=set(by_hunk),
-        )
 
         title = self.doc.add_paragraph()
         title.paragraph_format.space_after = Pt(2)
@@ -306,19 +305,15 @@ class _DocxBuilder:
             )
         self._hr()
 
-        gap = 0
-        for i, hunk in enumerate(hunks):
-            if not keep[i]:
-                gap += 1
+        for event, value in iter_visible(
+            hunks, self.context, comment_hunks=set(by_hunk),
+        ):
+            if event == "gap":
+                self._collapse(value)
                 continue
-            if gap:
-                self._collapse(gap)
-                gap = 0
-            self._render_hunk(hunk)
-            for c in by_hunk.get(i, []):
+            self._render_hunk(hunks[value])
+            for c in by_hunk.get(value, []):
                 self._comment_box(c)
-        if gap:
-            self._collapse(gap)
 
         if appendix:
             self._hr()
@@ -330,16 +325,10 @@ class _DocxBuilder:
                 self._comment_box(c)
 
         self.doc.save(out_path)
-        return {
-            "hunks": len(hunks),
-            "shown": sum(keep),
-            "comments_inline": len(comments) - len(appendix),
-            "comments_appendix": len(appendix),
-        }
 
 
 def render_docx(
     model: dict, out_path: str, context: int = DEFAULT_CONTEXT,
-) -> dict:
-    """Render the diff model to a styled .docx file. Returns stats."""
-    return _DocxBuilder(model, context).build(out_path)
+) -> None:
+    """Render the diff model to a styled .docx file."""
+    _DocxBuilder(model, context).build(out_path)

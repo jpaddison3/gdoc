@@ -57,16 +57,12 @@ def _make_args(**overrides):
     return SimpleNamespace(**defaults)
 
 
-def _version_data(version=42):
-    return {"version": version, "modifiedTime": "2026-06-10T10:00:00Z"}
-
-
 def _patches(func):
     """Stack the standard mocks for revision-diff handler tests.
 
     The first-applied patch is innermost, so mock args arrive in this
     order: (pre_flight, list_revisions, export_revision, get_file_info,
-    get_file_version, update_state).
+    update_state).
     """
     func = patch("gdoc.notify.pre_flight", return_value=None)(func)
     func = patch(
@@ -79,9 +75,6 @@ def _patches(func):
         "gdoc.api.drive.get_file_info",
         return_value={"name": "My Doc", "version": 42},
     )(func)
-    func = patch(
-        "gdoc.api.drive.get_file_version", return_value=_version_data(),
-    )(func)
     func = patch("gdoc.state.update_state_after_command")(func)
     return func
 
@@ -89,7 +82,7 @@ def _patches(func):
 class TestRevSelection:
     @_patches
     def test_rev_range_json_model(
-        self, _pf, _list, _export, _info, _ver, _update, capsys,
+        self, _pf, _list, _export, _info, _update, capsys,
     ):
         rc = cmd_diff(_make_args(rev="1..20", json=True))
         assert rc == 1
@@ -107,7 +100,7 @@ class TestRevSelection:
 
     @_patches
     def test_single_rev_diffs_against_latest(
-        self, _pf, _list, mock_export, _info, _ver, _update, capsys,
+        self, _pf, _list, mock_export, _info, _update, capsys,
     ):
         rc = cmd_diff(_make_args(rev="1", json=True))
         assert rc == 1
@@ -116,7 +109,7 @@ class TestRevSelection:
 
     @_patches
     def test_since_resolves_old_revision(
-        self, _pf, _list, mock_export, _info, _ver, _update, capsys,
+        self, _pf, _list, mock_export, _info, _update, capsys,
     ):
         rc = cmd_diff(_make_args(since="2026-06-09T00:00:00Z", json=True))
         assert rc == 1
@@ -125,7 +118,7 @@ class TestRevSelection:
 
     @_patches
     def test_identical_revisions_return_zero(
-        self, _pf, _list, _export, _info, _ver, _update, capsys,
+        self, _pf, _list, _export, _info, _update, capsys,
     ):
         rc = cmd_diff(_make_args(rev="66..66"))
         assert rc == 0
@@ -135,7 +128,7 @@ class TestRevSelection:
 class TestRevOutput:
     @_patches
     def test_plain_terminal_output(
-        self, _pf, _list, _export, _info, _ver, _update, capsys,
+        self, _pf, _list, _export, _info, _update, capsys,
     ):
         rc = cmd_diff(_make_args(rev="1..20", format="plain"))
         assert rc == 1
@@ -146,7 +139,7 @@ class TestRevOutput:
 
     @_patches
     def test_color_terminal_output(
-        self, _pf, _list, _export, _info, _ver, _update, capsys,
+        self, _pf, _list, _export, _info, _update, capsys,
     ):
         rc = cmd_diff(_make_args(rev="1..20", format="color"))
         assert rc == 1
@@ -154,7 +147,7 @@ class TestRevOutput:
 
     @_patches
     def test_html_artifact(
-        self, _pf, _list, _export, _info, _ver, _update, capsys, tmp_path,
+        self, _pf, _list, _export, _info, _update, capsys, tmp_path,
     ):
         out_path = tmp_path / "diff.html"
         rc = cmd_diff(_make_args(rev="1..20", out=str(out_path)))
@@ -166,7 +159,7 @@ class TestRevOutput:
 
     @_patches
     def test_docx_artifact(
-        self, _pf, _list, _export, _info, _ver, _update, capsys, tmp_path,
+        self, _pf, _list, _export, _info, _update, capsys, tmp_path,
     ):
         docx = pytest.importorskip("docx")
         out_path = tmp_path / "diff.docx"
@@ -178,7 +171,7 @@ class TestRevOutput:
 
     @_patches
     def test_with_comments_in_json(
-        self, _pf, _list, _export, _info, _ver, _update, capsys,
+        self, _pf, _list, _export, _info, _update, capsys,
     ):
         comments = [{
             "id": "c1", "author": {"displayName": "Alice"},
@@ -203,13 +196,25 @@ class TestRevOutput:
 
     @_patches
     def test_state_updated_with_version(
-        self, _pf, _list, _export, _info, _ver, mock_update, capsys,
+        self, _pf, _list, _export, _info, mock_update, capsys,
     ):
+        # The version comes from get_file_info's metadata — no extra
+        # get_file_version round trip.
         cmd_diff(_make_args(rev="1..20", json=True))
         mock_update.assert_called_once_with(
             "abc123", None, command="diff", quiet=False,
             command_version=42,
         )
+
+    @_patches
+    def test_docx_write_error_exits_3(
+        self, _pf, _list, _export, _info, _update, tmp_path,
+    ):
+        pytest.importorskip("docx")
+        out_path = tmp_path / "no-such-dir" / "diff.docx"
+        with pytest.raises(GdocError, match="cannot write file") as exc_info:
+            cmd_diff(_make_args(rev="1..20", out=str(out_path)))
+        assert exc_info.value.exit_code == 3
 
 
 class TestRevValidation:
@@ -246,6 +251,29 @@ class TestRevValidation:
     def test_json_flag_with_rich_format(self):
         with pytest.raises(GdocError, match="mutually exclusive") as exc_info:
             cmd_diff(_make_args(rev="1..20", json=True, format="docx"))
+        assert exc_info.value.exit_code == 3
+
+    def test_json_flag_with_terminal_format(self):
+        with pytest.raises(GdocError, match="mutually exclusive") as exc_info:
+            cmd_diff(_make_args(rev="1..20", json=True, format="color"))
+        assert exc_info.value.exit_code == 3
+
+    def test_plain_flag_with_color_format(self):
+        with pytest.raises(GdocError, match="mutually exclusive") as exc_info:
+            cmd_diff(_make_args(rev="1..20", plain=True, format="color"))
+        assert exc_info.value.exit_code == 3
+
+    def test_format_contradicts_out_extension(self):
+        with pytest.raises(GdocError, match="contradicts") as exc_info:
+            cmd_diff(_make_args(rev="1..20", format="html", out="x.docx"))
+        assert exc_info.value.exit_code == 3
+
+    def test_with_comments_requires_rich_format(self):
+        with pytest.raises(
+            GdocError, match="--with-comments requires",
+        ) as exc_info:
+            cmd_diff(_make_args(rev="1..20", format="plain",
+                                with_comments=True))
         assert exc_info.value.exit_code == 3
 
     def test_invalid_range_fails_before_api_calls(self):

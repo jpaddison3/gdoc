@@ -52,9 +52,13 @@ def add_frontmatter(body: str, metadata: dict) -> str:
 
     Returns:
         Content with frontmatter prepended.
+
+    Values are flattened to a single line: a newline in a value (e.g. a
+    doc title) would otherwise inject arbitrary frontmatter keys.
     """
     lines = ["---"]
     for key, value in metadata.items():
+        value = re.sub(r"[\r\n]+", " ", str(value))
         lines.append(f"{key}: {value}")
     lines.append("---")
     lines.append("")

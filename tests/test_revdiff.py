@@ -39,6 +39,11 @@ class TestSelectors:
     def test_prev(self):
         assert resolve_selector(REVS, "prev")["id"] == "20"
 
+    def test_prev_out_of_range_names_prev(self):
+        single = [{"id": "5", "modifiedTime": "2026-06-01T10:00:00.000Z"}]
+        with pytest.raises(GdocError, match="prev is out of range"):
+            resolve_selector(single, "prev")
+
     def test_head_n_counts_by_position_not_id(self):
         assert resolve_selector(REVS, "head~2")["id"] == "7"
         assert resolve_selector(REVS, "latest~4")["id"] == "1"
@@ -128,10 +133,16 @@ class TestLoadBlocks:
             "A paragraph.\n"
             "\n"
             "[image1]: <data:image/png;base64,AAAA>\n"
-            "some line with data:image/png;base64,BBBB inline\n"
+            "data:image/png;base64,BBBB\n"
             "Last.\n"
         )
         assert load_blocks(text) == ["# Title", "A paragraph.", "Last."]
+
+    def test_prose_mentioning_data_image_is_kept(self):
+        text = "A paragraph about data:image URIs in HTML.\n"
+        assert load_blocks(text) == [
+            "A paragraph about data:image URIs in HTML.",
+        ]
 
 
 class TestBlockClassification:
@@ -209,6 +220,22 @@ class TestBuildHunks:
         assert hunks[0]["block_type"] == "paragraph"
         assert hunks[0]["runs"][0]["text"] == "# not a heading"
 
+    def test_case_only_change_is_a_real_diff(self):
+        # Alignment is case-insensitive, but the final kind must come
+        # from the text a reader actually sees.
+        hunks = build_hunks(
+            "Hello World, this sentence stays put.\n",
+            "hello world, this sentence stays put.\n",
+        )
+        assert [h["kind"] for h in hunks] == ["replace"]
+
+    def test_escape_only_difference_is_equal(self):
+        hunks = build_hunks(
+            "A sentence \\- with escaped punctuation.\n",
+            "A sentence - with escaped punctuation.\n",
+        )
+        assert [h["kind"] for h in hunks] == ["equal"]
+
 
 def _comment(cid, quoted, content="note", author="Alice",
              created="2026-06-09T00:00:00Z"):
@@ -247,6 +274,19 @@ class TestAttachComments:
     def test_unmatched_goes_to_appendix(self):
         hunks = build_hunks("Some text.\n", "Some text.\n")
         [comment] = attach_comments(hunks, [_comment("c1", "no such anchor")])
+        assert comment["hunk"] is None
+
+    def test_no_match_across_replace_junction(self):
+        # The anchor spans the end of the old side and the start of the
+        # new side; neither side alone contains it.
+        hunk = {
+            "kind": "replace", "block_type": "paragraph",
+            "runs": [
+                {"op": "del", "text": "the draft ends with alpha"},
+                {"op": "ins", "text": "beta begins the new text"},
+            ],
+        }
+        [comment] = attach_comments([hunk], [_comment("c1", "alpha beta")])
         assert comment["hunk"] is None
 
     def test_short_anchor_not_matched(self):

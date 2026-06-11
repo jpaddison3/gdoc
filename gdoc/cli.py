@@ -5,6 +5,7 @@ import os
 import sys
 
 from gdoc import __version__
+from gdoc.revdiff import DEFAULT_CONTEXT, DEFAULT_MIN_COMMON
 from gdoc.util import SPREADSHEET_MIME, AuthError, GdocError
 
 
@@ -296,8 +297,10 @@ def cmd_cat(args) -> int:
         from gdoc.api.revisions import export_revision
 
         rev = _resolve_revision(doc_id, revision)
-        mime = "text/plain" if getattr(args, "plain", False) \
+        mime = (
+            "text/plain" if getattr(args, "plain", False)
             else "text/markdown"
+        )
         content = export_revision(
             doc_id, rev["id"], mime_type=mime,
             export_links=rev.get("exportLinks"),
@@ -1489,6 +1492,13 @@ def cmd_push(args) -> int:
 
     metadata, body = parse_frontmatter(content)
     if "gdoc" not in metadata:
+        if "revision" in metadata or "source" in metadata:
+            raise GdocError(
+                "this file was pulled from a past revision and is not "
+                "pushable (it would overwrite the live doc with stale "
+                "content). Use 'gdoc pull' for an editable copy.",
+                exit_code=3,
+            )
         raise GdocError(
             "no gdoc frontmatter found. Use 'gdoc pull' first.",
             exit_code=3,
@@ -1712,9 +1722,21 @@ def _resolve_diff_format(args) -> str:
                 ".docx); pass --format",
                 exit_code=3,
             )
-    if fmt in ("html", "docx") and mode == "json":
+    if out and fmt in ("html", "docx"):
+        other = {"html": ".docx", "docx": ".html"}[fmt]
+        if out.endswith(other):
+            raise GdocError(
+                f"--format {fmt} contradicts output path {out!r}",
+                exit_code=3,
+            )
+    if mode == "json" and fmt not in ("auto", "json"):
         raise GdocError(
-            "--json and --format html/docx are mutually exclusive",
+            f"--json and --format {fmt} are mutually exclusive",
+            exit_code=3,
+        )
+    if mode == "plain" and fmt not in ("auto", "plain", "html", "docx"):
+        raise GdocError(
+            f"--plain and --format {fmt} are mutually exclusive",
             exit_code=3,
         )
     if out and fmt not in ("html", "docx"):
@@ -1736,11 +1758,17 @@ def _diff_revisions(args, doc_id: str) -> int:
     """Revision-vs-revision diff (`gdoc diff --rev` / `--since`)."""
     quiet = getattr(args, "quiet", False)
     since = getattr(args, "since", None)
-    min_common = getattr(args, "min_common", 24)
-    context = getattr(args, "context", 2)
+    min_common = getattr(args, "min_common", DEFAULT_MIN_COMMON)
+    context = getattr(args, "context", DEFAULT_CONTEXT)
     with_comments = getattr(args, "with_comments", False)
 
     fmt = _resolve_diff_format(args)
+    if with_comments and fmt in ("color", "plain"):
+        raise GdocError(
+            "--with-comments requires --format html, docx, or json "
+            "(the terminal renderer does not show comments)",
+            exit_code=3,
+        )
 
     from gdoc.revdiff import (
         build_diff_model,
@@ -1822,7 +1850,10 @@ def _diff_revisions(args, doc_id: str) -> int:
                     exit_code=3,
                 )
             from gdoc.diffdocx import render_docx
-            render_docx(model, out_path, context=context)
+            try:
+                render_docx(model, out_path, context=context)
+            except OSError as e:
+                raise GdocError(f"cannot write file: {e}", exit_code=3)
 
         anchored = ""
         if "comments" in model:
@@ -1848,14 +1879,12 @@ def _diff_revisions(args, doc_id: str) -> int:
             end="",
         )
 
-    # Update state
-    from gdoc.api.drive import get_file_version
+    # Update state (version already fetched via get_file_info above)
     from gdoc.state import update_state_after_command
 
-    command_version = get_file_version(doc_id).get("version")
     update_state_after_command(
         doc_id, change_info, command="diff", quiet=quiet,
-        command_version=command_version,
+        command_version=metadata.get("version"),
     )
 
     return 1 if changed else 0
@@ -2995,13 +3024,14 @@ def build_parser() -> GdocArgumentParser:
              "revision diffs",
     )
     diff_p.add_argument(
-        "--min-common", type=int, default=24, metavar="N",
+        "--min-common", type=int, default=DEFAULT_MIN_COMMON, metavar="N",
         help="Coalescing threshold for word-diff chunks "
-             "(higher = chunkier; default 24)",
+             f"(higher = chunkier; default {DEFAULT_MIN_COMMON})",
     )
     diff_p.add_argument(
-        "--context", type=int, default=2, metavar="N",
-        help="Unchanged blocks kept around each change (default 2)",
+        "--context", type=int, default=DEFAULT_CONTEXT, metavar="N",
+        help="Unchanged blocks kept around each change "
+             f"(default {DEFAULT_CONTEXT})",
     )
     diff_p.add_argument(
         "--quiet", action="store_true", help="Skip pre-flight checks"

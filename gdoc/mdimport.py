@@ -8,6 +8,11 @@ from dataclasses import dataclass
 
 _IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
 
+# Reference-style images as emitted by the Drive markdown export:
+# `![][imageN]` refs plus `[imageN]: <data:image/...>` definitions.
+_IMAGE_REF_RE = re.compile(r"!\[\]\[image\d+\]")
+_IMAGE_DEF_RE = re.compile(r"^[ \t]*\[image\d+\][ \t]*:.*$", re.MULTILINE)
+
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
 _MIME_TYPES = {
@@ -106,7 +111,13 @@ def extract_images(
 
 
 def strip_images(content: str) -> str:
-    """Remove image references and collapse excess blank lines."""
+    """Remove image references and collapse excess blank lines.
+
+    Handles both inline ``![alt](path)`` images and the reference
+    style the Drive markdown export emits.
+    """
     result = _IMAGE_RE.sub("", content)
+    result = _IMAGE_REF_RE.sub("", result)
+    result = _IMAGE_DEF_RE.sub("", result)
     result = re.sub(r"\n{3,}", "\n\n", result)
     return result

@@ -109,6 +109,16 @@ class TestAddFrontmatter:
         result = add_frontmatter("Body", {})
         assert result == "---\n---\nBody"
 
+    def test_newlines_in_values_flattened(self):
+        # A newline in a value (e.g. a doc title) must not be able to
+        # inject extra frontmatter keys like `gdoc:`.
+        result = add_frontmatter(
+            "Body", {"title": "Line one\ngdoc: evil-id"},
+        )
+        metadata, _ = parse_frontmatter(result)
+        assert "gdoc" not in metadata
+        assert metadata["title"] == "Line one gdoc: evil-id"
+
     def test_roundtrip(self):
         original_body = "# Document\n\nContent here.\n"
         original_meta = {"gdoc": "1aBcDeFg", "title": "Project Spec"}

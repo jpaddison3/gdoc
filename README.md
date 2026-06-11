@@ -349,7 +349,9 @@ gdoc pull DOC_ID old-draft.md --revision @2026-06-01
 
 **REV selectors** (shared by `cat`, `pull`, and `diff`): a bare revision id (`190`), `latest`/`head`, `prev`, `head~N` (N back from latest by list position), or `@ISO` (last revision at/before the timestamp; naive timestamps are local time).
 
-Revision diffs print a colored word-diff to a TTY (plain text when piped; `--format` overrides). Rewritten sentences render as one contiguous removed/added chunk rather than word salad — shared scraps shorter than `--min-common` characters (default 24) are absorbed into the change. `--context N` controls how many unchanged blocks are kept around each change; the rest collapse to `⋯ N unchanged ⋯` (headings always stay). `--json` emits a stable diff model (`doc`/`old`/`new`/`hunks`, each hunk a list of `equal|del|ins` runs, plus `comments` with their anchored hunk index when `--with-comments` is set). Exit code follows `diff DOC FILE`: 1 when the revisions differ, 0 when identical.
+Revision diffs print a colored word-diff to a TTY (plain text when piped; `--format` overrides). Rewritten sentences render as one contiguous removed/added chunk rather than word salad — shared scraps shorter than `--min-common` characters (default 24) are absorbed into the change. `--context N` controls how many unchanged blocks are kept around each change; the rest collapse to `⋯ N unchanged ⋯` (headings always stay). `--json` emits the documented diff model (`doc`/`old`/`new`/`hunks`, each hunk a list of `equal|del|ins` runs, plus `comments` with their anchored hunk index when `--with-comments` is set) wrapped with top-level `ok` and `identical` keys. Exit code follows `diff DOC FILE`: 1 when the revisions differ, 0 when identical.
+
+The diff model is display-oriented, not a faithful character diff: export escaping and whitespace are normalized, images become `⟦diagram⟧` placeholders, and coalescing relabels short unchanged spans as part of the surrounding change (pass `--min-common 0` for the uncoalesced word diff). The engine also parses Google's current markdown-export conventions (one line per paragraph, `![][imageN]` references) — like revision pruning, this is undocumented Google behavior that may change.
 
 `--format docx` needs the optional `python-docx` dependency (`pip install 'gdoc[docx]'` or `uv tool install 'gdoc[docx]'`); HTML output has no extra dependencies.
 
@@ -489,6 +491,8 @@ gdoc edit DOC "old" "new"  # ERR: command not allowed: edit
 | 1 | API or unexpected error |
 | 2 | Authentication error (run `gdoc auth`) |
 | 3 | Usage or validation error |
+
+Exception: `gdoc diff` follows `diff(1)` semantics — exit 1 means the contents differ, 0 means identical.
 
 Errors always print `ERR: <message>` to stderr, even in `--json` mode.
 

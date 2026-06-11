@@ -22,6 +22,12 @@ schema::
                       "createdTime": "..."}]}
       ]
     }
+
+The CLI's ``--json`` output wraps this model with top-level ``ok`` and
+``identical`` keys. The model is display-oriented, not a faithful
+character diff: ``clean_text`` normalizes export escaping/whitespace
+and replaces images with placeholders, and coalescing (``min_common``)
+absorbs short unchanged spans into the surrounding change.
 """
 
 import difflib
@@ -36,8 +42,11 @@ DEFAULT_CONTEXT = 2
 
 _IMAGE_REF = re.compile(r"!\[\]\[image\d+\]")
 _IMAGE_DEF = re.compile(r"^\s*\[image\d+\]\s*:")
-_HEADING = re.compile(r"^(#{1,6})\s")
-_LISTITEM = re.compile(r"^\s*(\\?[*\-]|\d+[.)\\]+)\s")
+_HEADING_MARK = r"#{1,6}"
+_BULLET_MARK = r"\\?[*\-]"
+_ORDERED_MARK = r"\d+[.)\\]+"
+_HEADING = re.compile(rf"^({_HEADING_MARK})\s")
+_LISTITEM = re.compile(rf"^\s*({_BULLET_MARK}|{_ORDERED_MARK})\s")
 _TOKEN = re.compile(r"\s+|\S+")
 _HEAD_N = re.compile(r"^(?:head|latest)~(\d+)$")
 
@@ -76,7 +85,7 @@ def resolve_selector(revisions: list[dict], selector: str) -> dict:
     if lowered in ("latest", "head"):
         return revisions[-1]
     if lowered == "prev":
-        return _nth_before_latest(revisions, 1)
+        return _nth_before_latest(revisions, 1, label="prev")
     match = _HEAD_N.match(lowered)
     if match:
         return _nth_before_latest(revisions, int(match.group(1)))
@@ -85,19 +94,27 @@ def resolve_selector(revisions: list[dict], selector: str) -> dict:
     for rev in revisions:
         if rev.get("id") == s:
             return rev
-    raise GdocError(
-        f"revision not found: {s} (it may have been pruned — Google "
-        "drops non-pinned revisions over time). "
+    raise pruned_error(s)
+
+
+def pruned_error(revision_id: str) -> GdocError:
+    """The shared not-found/pruned error (also raised by the API layer)."""
+    return GdocError(
+        f"revision not found: {revision_id} (it may have been pruned — "
+        "Google drops non-pinned revisions over time). "
         "Run `gdoc revisions DOC` to see retained revisions.",
         exit_code=3,
     )
 
 
-def _nth_before_latest(revisions: list[dict], n: int) -> dict:
+def _nth_before_latest(
+    revisions: list[dict], n: int, label: str | None = None,
+) -> dict:
     index = len(revisions) - 1 - n
     if index < 0:
         raise GdocError(
-            f"head~{n} is out of range (only {len(revisions)} "
+            f"{label or f'head~{n}'} is out of range (only "
+            f"{len(revisions)} "
             f"revision{'s' if len(revisions) != 1 else ''} retained). "
             "Run `gdoc revisions DOC`.",
             exit_code=3,
@@ -165,7 +182,7 @@ def clean_text(s: str) -> str:
             break
         s = unescaped
     s = re.sub(r"^>\s*", "", s)
-    s = s.replace(" ", " ")
+    s = s.replace("\u00a0", " ")  # nbsp
     return re.sub(r"[ \t]+", " ", s).strip()
 
 
@@ -174,15 +191,28 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", html.unescape(s)).strip().lower()
 
 
+def _align_key(block: str) -> str:
+    """Key for pairing blocks across revisions.
+
+    Cleans before normalizing so escape-only noise between exports
+    doesn't break pairing; the paired blocks' *final* equal-vs-replace
+    kind is decided from their cleaned display text in `_make_hunk`.
+    """
+    return _norm(clean_text(block))
+
+
 def load_blocks(text: str) -> list[str]:
     """Split exported markdown into non-blank blocks.
 
     The export emits one long line per paragraph. Drops blank lines,
-    base64 ``data:image`` blobs, and ``[imageN]: ...`` definitions.
+    ``[imageN]: ...`` definitions, and stray base64 ``data:image``
+    blob lines (prose that merely mentions data:image is kept).
     """
     blocks = []
     for raw in text.splitlines():
-        if "data:image" in raw or _IMAGE_DEF.match(raw):
+        if _IMAGE_DEF.match(raw) or raw.lstrip().startswith(
+            ("data:image", "<data:image"),
+        ):
             continue
         stripped = raw.strip()
         if not stripped:
@@ -207,9 +237,9 @@ def heading_level(block: str) -> int:
 
 def strip_marker(block: str) -> str:
     """Strip the leading markdown marker (#, bullet, or number)."""
-    block = re.sub(r"^#{1,6}\s+", "", block)
-    block = re.sub(r"^\s*\\?[*\-]\s+", "", block)
-    block = re.sub(r"^\s*\d+[.)\\]+\s+", "", block)
+    block = re.sub(rf"^{_HEADING_MARK}\s+", "", block)
+    block = re.sub(rf"^\s*{_BULLET_MARK}\s+", "", block)
+    block = re.sub(rf"^\s*{_ORDERED_MARK}\s+", "", block)
     return block
 
 
@@ -277,15 +307,20 @@ def _make_hunk(
 ) -> dict:
     src = new_block if new_block is not None else old_block
     block_type = classify_block(src)
-    hunk: dict = {"kind": kind, "block_type": block_type}
-    if block_type == "heading":
-        hunk["level"] = heading_level(src)
     old_text = (
         clean_text(strip_marker(old_block)) if old_block is not None else ""
     )
     new_text = (
         clean_text(strip_marker(new_block)) if new_block is not None else ""
     )
+    if kind in ("equal", "replace"):
+        # Alignment pairs blocks loosely (case-insensitive), so a pair
+        # can arrive here either way; the final kind depends on the
+        # cleaned text a reader actually sees.
+        kind = "equal" if old_text == new_text else "replace"
+    hunk: dict = {"kind": kind, "block_type": block_type}
+    if block_type == "heading":
+        hunk["level"] = heading_level(src)
     if kind == "equal":
         hunk["runs"] = [{"op": "equal", "text": new_text}]
     elif kind == "insert":
@@ -304,8 +339,8 @@ def build_hunks(
     old_blocks = load_blocks(old_md)
     new_blocks = load_blocks(new_md)
     matcher = difflib.SequenceMatcher(
-        a=[_norm(b) for b in old_blocks],
-        b=[_norm(b) for b in new_blocks],
+        a=[_align_key(b) for b in old_blocks],
+        b=[_align_key(b) for b in new_blocks],
         autojunk=False,
     )
     hunks: list[dict] = []
@@ -392,8 +427,10 @@ def attach_comments(hunks: list[dict], comments: list[dict]) -> list[dict]:
     not the first stray occurrence). Unmatched threads get hunk=None
     and render as an appendix — they are never dropped.
     """
+    # Sides matched separately: concatenating old + new would let a
+    # key false-match across the artificial junction of a replace hunk.
     match_texts = [
-        _norm(hunk_side_text(h, "old") + " " + hunk_side_text(h, "new"))
+        (_norm(hunk_side_text(h, "old")), _norm(hunk_side_text(h, "new")))
         for h in hunks
     ]
     model_comments = []
@@ -407,8 +444,8 @@ def attach_comments(hunks: list[dict], comments: list[dict]) -> list[dict]:
             and len(anchor) >= _ANCHOR_MIN_LEN
             and anchor not in _ANCHOR_STOPWORDS
         ):
-            for idx, match_text in enumerate(match_texts):
-                if key in match_text:
+            for idx, (old_side, new_side) in enumerate(match_texts):
+                if key in old_side or key in new_side:
                     if hunk_changed(hunks[idx]):
                         target = idx
                         break

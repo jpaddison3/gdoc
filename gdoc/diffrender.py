@@ -1,6 +1,12 @@
-"""Terminal (color/plain) and HTML renderers for the revision-diff model."""
+"""Terminal (color/plain) and HTML renderers for the revision-diff model.
+
+Also home to the view-selection helpers (`select_visible`,
+`iter_visible`, `split_comments`, `short_time`, `clip_quoted`) shared
+with gdoc.diffdocx.
+"""
 
 import html as html_mod
+from collections.abc import Iterator
 
 from gdoc.revdiff import DEFAULT_CONTEXT, hunk_changed
 
@@ -30,6 +36,27 @@ def select_visible(
     return keep
 
 
+def iter_visible(
+    hunks: list[dict],
+    context: int = DEFAULT_CONTEXT,
+    comment_hunks: frozenset | set = frozenset(),
+) -> Iterator[tuple[str, int]]:
+    """Yield ("gap", count) / ("hunk", index) events, collapsing
+    consecutive hidden hunks into one gap."""
+    keep = select_visible(hunks, context, comment_hunks=comment_hunks)
+    gap = 0
+    for i in range(len(hunks)):
+        if not keep[i]:
+            gap += 1
+            continue
+        if gap:
+            yield "gap", gap
+            gap = 0
+        yield "hunk", i
+    if gap:
+        yield "gap", gap
+
+
 def split_comments(comments: list[dict]) -> tuple[dict, list[dict]]:
     """Group model comments by anchored hunk index; rest go to appendix."""
     by_hunk: dict[int, list[dict]] = {}
@@ -45,6 +72,14 @@ def split_comments(comments: list[dict]) -> tuple[dict, list[dict]]:
 def short_time(iso: str) -> str:
     """Trim an RFC3339 UTC timestamp to 'YYYY-MM-DD HH:MMZ'."""
     return iso[:16].replace("T", " ") + "Z" if iso else "?"
+
+
+_QUOTED_MAX = 90
+
+
+def clip_quoted(text: str) -> str:
+    """Truncate a comment's quoted snippet for display."""
+    return text[:_QUOTED_MAX] + "…" if len(text) > _QUOTED_MAX else text
 
 
 # ---------------------------------------------------------------- terminal
@@ -82,27 +117,17 @@ def render_terminal(
     lines = [f"{_DIM}{header}{_RESET}" if color else header, ""]
 
     hunks = model["hunks"]
-    keep = select_visible(hunks, context)
-    gap = 0
-
-    def flush_gap():
-        nonlocal gap
-        if gap:
-            label = f"⋯ {gap} unchanged ⋯"
+    for event, value in iter_visible(hunks, context):
+        if event == "gap":
+            label = f"⋯ {value} unchanged ⋯"
             lines.append(f"{_DIM}{label}{_RESET}" if color else label)
-            gap = 0
-
-    for i, hunk in enumerate(hunks):
-        if not keep[i]:
-            gap += 1
             continue
-        flush_gap()
+        hunk = hunks[value]
         body = "".join(_term_run(r, color) for r in hunk["runs"])
         line = _block_prefix(hunk) + body
         if color and hunk["kind"] == "equal":
             line = f"{_DIM}{line}{_RESET}"
         lines.append(line)
-    flush_gap()
 
     return "\n".join(lines) + "\n"
 
@@ -190,11 +215,9 @@ def _html_comment(c: dict, bar: str) -> str:
         f'<div class="head">{head}</div>',
     ]
     if c.get("quoted"):
-        quoted = c["quoted"]
-        if len(quoted) > 90:
-            quoted = quoted[:90] + "…"
         parts.append(
-            f'<div class="on">on: “{html_mod.escape(quoted)}”</div>'
+            '<div class="on">on: '
+            f"“{html_mod.escape(clip_quoted(c['quoted']))}”</div>"
         )
     parts.append(f"<div>{html_mod.escape(c['content'])}</div>")
     for r in c.get("replies", []):
@@ -211,7 +234,6 @@ def render_html(model: dict, context: int = DEFAULT_CONTEXT) -> str:
     hunks = model["hunks"]
     comments = model.get("comments", [])
     by_hunk, appendix = split_comments(comments)
-    keep = select_visible(hunks, context, comment_hunks=set(by_hunk))
 
     author_bars: dict[str, str] = {}
 
@@ -234,28 +256,26 @@ def render_html(model: dict, context: int = DEFAULT_CONTEXT) -> str:
     body: list[str] = [
         f'<h1 class="title">{name} — revision diff</h1>',
         '<div class="meta">'
-        f'<span class="old">rev {old["id"]} '
+        f'<span class="old">rev {html_mod.escape(str(old["id"]))} '
         f"({html_mod.escape(short_time(old['modifiedTime']))})</span>"
         " → "
-        f'<span class="new">rev {new["id"]} '
+        f'<span class="new">rev {html_mod.escape(str(new["id"]))} '
         f"({html_mod.escape(short_time(new['modifiedTime']))})</span>"
         "</div>",
         f'<div class="legend">{legend}</div>',
     ]
 
-    gap = 0
-    for i, hunk in enumerate(hunks):
-        if not keep[i]:
-            gap += 1
+    for event, value in iter_visible(
+        hunks, context, comment_hunks=set(by_hunk),
+    ):
+        if event == "gap":
+            body.append(
+                f'<div class="collapse">⋯ {value} unchanged ⋯</div>'
+            )
             continue
-        if gap:
-            body.append(f'<div class="collapse">⋯ {gap} unchanged ⋯</div>')
-            gap = 0
-        body.append(_html_hunk(hunk))
-        for c in by_hunk.get(i, []):
+        body.append(_html_hunk(hunks[value]))
+        for c in by_hunk.get(value, []):
             body.append(_html_comment(c, bar(c["author"])))
-    if gap:
-        body.append(f'<div class="collapse">⋯ {gap} unchanged ⋯</div>')
 
     if appendix:
         body.append('<div class="appendix">')

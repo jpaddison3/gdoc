@@ -7,15 +7,21 @@ Revision ids are sparse and non-``keepForever`` revisions are pruned by
 Google over time (~weeks).
 """
 
+import sys
+from functools import lru_cache
+
 from googleapiclient.errors import HttpError
 
 from gdoc.api import get_drive_service
+from gdoc.revdiff import pruned_error as _pruned_error
 from gdoc.util import AuthError, GdocError
 
 _REVISION_FIELDS = (
     "id, modifiedTime, keepForever, "
     "lastModifyingUser(displayName, emailAddress), exportLinks"
 )
+
+_EXPORT_TIMEOUT = 30  # seconds, matches gdoc.auth
 
 
 def _translate_http_error(e: HttpError, file_id: str) -> None:
@@ -30,13 +36,14 @@ def _translate_http_error(e: HttpError, file_id: str) -> None:
     raise GdocError(f"API error ({status}): {e.reason}")
 
 
-def _pruned_error(revision_id: str) -> GdocError:
-    return GdocError(
-        f"revision not found: {revision_id} (it may have been pruned — "
-        "Google drops non-pinned revisions over time). "
-        "Run `gdoc revisions DOC` to see retained revisions.",
-        exit_code=3,
-    )
+@lru_cache(maxsize=1)
+def _get_session():
+    """One authorized HTTP session per process (exportLinks downloads)."""
+    from google.auth.transport.requests import AuthorizedSession
+
+    from gdoc.auth import get_credentials
+
+    return AuthorizedSession(get_credentials())
 
 
 def list_revisions(file_id: str) -> list[dict]:
@@ -66,6 +73,9 @@ def list_revisions(file_id: str) -> list[dict]:
             if page_token is None:
                 break
 
+        # Drive doesn't document an ordering guarantee; the selector
+        # grammar (latest/prev/head~N/@ISO) depends on oldest-first.
+        revisions.sort(key=lambda r: r.get("modifiedTime", ""))
         return revisions
     except HttpError as e:
         _translate_http_error(e, file_id)
@@ -108,22 +118,29 @@ def export_revision(
                 raise _pruned_error(revision_id)
             _translate_http_error(e, file_id)
 
-    url = export_links.get(mime_type) or export_links.get("text/plain")
+    url = export_links.get(mime_type)
+    if not url:
+        url = export_links.get("text/plain")
+        if url and mime_type != "text/plain":
+            print(
+                f"WARN: revision {revision_id} has no {mime_type} "
+                "export; falling back to text/plain",
+                file=sys.stderr,
+            )
     if not url:
         raise GdocError(
             f"revision {revision_id} has no {mime_type} export link"
         )
 
-    from google.auth.transport.requests import AuthorizedSession
-
-    from gdoc.auth import get_credentials
-
-    session = AuthorizedSession(get_credentials())
-    response = session.get(url)
+    response = _get_session().get(url, timeout=_EXPORT_TIMEOUT)
     if response.status_code == 404:
         raise _pruned_error(revision_id)
-    if response.status_code in (401, 403):
+    if response.status_code == 401:
         raise AuthError("Authentication expired. Run `gdoc auth`.")
+    if response.status_code == 403:
+        # Not an expired token: the session auto-refreshes, so a 403
+        # here means export/download is denied for this file.
+        raise GdocError(f"Permission denied: {file_id}")
     if response.status_code != 200:
         raise GdocError(
             f"export failed for revision {revision_id} "
