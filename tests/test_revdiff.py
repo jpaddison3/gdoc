@@ -267,6 +267,16 @@ class TestBuildHunks:
             "1\\. The same item text here.\n",
         )
         assert [h["kind"] for h in hunks] == ["delete", "insert"]
+        # markers carried so renderers can show what changed
+        assert [h["marker"] for h in hunks] == ["•", "1."]
+
+    def test_listitem_marker_recorded(self):
+        hunks = build_hunks(
+            "2\\. An ordered item with text.\n\n"
+            "- A bulleted item with text.\n",
+            "",
+        )
+        assert [h.get("marker") for h in hunks] == ["2.", "•"]
 
 
 def _comment(cid, quoted, content="note", author="Alice",

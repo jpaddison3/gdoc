@@ -231,7 +231,7 @@ class _DocxBuilder:
         p = self.doc.add_paragraph()
         p.paragraph_format.space_after = Pt(5)
         bullet = hunk["block_type"] == "listitem"
-        prefix = "•  " if bullet else ""
+        prefix = hunk.get("marker", "•") + "  " if bullet else ""
         if bullet:
             p.paragraph_format.left_indent = Inches(0.3)
 

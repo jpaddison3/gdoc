@@ -12,6 +12,7 @@ schema::
         {"kind": "equal|insert|delete|replace",
          "block_type": "heading|paragraph|listitem",
          "level": 2,                      # headings only
+         "marker": "2.",                  # list items only ("•" for bullets)
          "runs": [{"op": "equal|del|ins", "text": "..."}]}
       ],
       "comments": [                       # only with --with-comments
@@ -242,6 +243,14 @@ def strip_marker(block: str) -> str:
     return block
 
 
+def _list_marker(block: str) -> str:
+    """Display marker for a list item: the real ordinal, or •."""
+    match = re.match(rf"^\s*({_BULLET_MARK}|{_ORDERED_MARK})\s", block)
+    if match and match.group(1)[0].isdigit():
+        return clean_text(match.group(1))
+    return "•"
+
+
 def _block_structure(block: str) -> tuple:
     """Structure key for same-text equality: type, level, list shape.
 
@@ -338,6 +347,8 @@ def _make_hunk(
     hunk: dict = {"kind": kind, "block_type": block_type}
     if block_type == "heading":
         hunk["level"] = heading_level(src)
+    elif block_type == "listitem":
+        hunk["marker"] = _list_marker(src)
     if kind == "equal":
         hunk["runs"] = [{"op": "equal", "text": new_text}]
     elif kind == "insert":

@@ -91,6 +91,19 @@ class TestRenderTerminal:
         )
         assert "## Section title here" in out
 
+    def test_list_markers_shown(self):
+        # Ordered items keep their ordinal; a bullet→numbered switch
+        # shows both forms
+        out = render_terminal(
+            _model(
+                "- The same item text here.\n",
+                "1\\. The same item text here.\n",
+            ),
+            color=False,
+        )
+        assert "• [-The same item text here.-]" in out
+        assert "1. {+The same item text here.+}" in out
+
 
 class TestRenderHtml:
     def test_ins_del_tags(self):

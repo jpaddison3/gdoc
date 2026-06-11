@@ -1713,7 +1713,6 @@ def _resolve_diff_format(args) -> str:
     out = getattr(args, "out", None)
     mode = get_output_mode(args)
 
-    inferred = False
     if fmt == "auto" and out:
         if out.endswith(".html"):
             fmt = "html"
@@ -1725,7 +1724,6 @@ def _resolve_diff_format(args) -> str:
                 ".docx); pass --format",
                 exit_code=3,
             )
-        inferred = True
     if out and fmt in ("html", "docx"):
         other = {"html": ".docx", "docx": ".html"}[fmt]
         if out.endswith(other):
@@ -1733,14 +1731,9 @@ def _resolve_diff_format(args) -> str:
                 f"--format {fmt} contradicts output path {out!r}",
                 exit_code=3,
             )
-    if mode == "json" and fmt not in ("auto", "json"):
-        if inferred:
-            # The user never passed --format; don't blame it
-            raise GdocError(
-                f"--json cannot be combined with an {fmt} artifact "
-                f"(--out {out})",
-                exit_code=3,
-            )
+    # --json composes with the artifact formats (JSON write
+    # confirmation on stdout) but not with the terminal formats
+    if mode == "json" and fmt in ("color", "plain"):
         raise GdocError(
             f"--json and --format {fmt} are mutually exclusive",
             exit_code=3,
@@ -1864,13 +1857,25 @@ def _diff_revisions(args, doc_id: str) -> int:
         except OSError as e:
             raise GdocError(f"cannot write file: {e}", exit_code=3)
 
+        inline = None
         anchored = ""
         if "comments" in model:
             inline = sum(
                 1 for c in model["comments"] if c["hunk"] is not None
             )
             anchored = f", {inline}/{len(model['comments'])} comments anchored"
-        if mode == "plain":
+        if mode == "json":
+            confirmation = {
+                "path": out_path,
+                "format": fmt,
+                "changed": changed,
+                "identical": changed == 0,
+            }
+            if inline is not None:
+                confirmation["comments"] = len(model["comments"])
+                confirmation["comments_anchored"] = inline
+            print(format_json(**confirmation))
+        elif mode == "plain":
             print(f"path\t{out_path}")
             print(f"changed\t{changed}")
         elif mode == "verbose":

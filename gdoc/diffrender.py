@@ -88,7 +88,7 @@ def _block_prefix(hunk: dict) -> str:
     if hunk["block_type"] == "heading":
         return "#" * hunk.get("level", 2) + " "
     if hunk["block_type"] == "listitem":
-        return "• "
+        return hunk.get("marker", "•") + " "
     return ""
 
 
@@ -197,7 +197,8 @@ def _html_hunk(hunk: dict) -> str:
         tag = f"h{min(hunk.get('level', 2) + 1, 4)}"
         return f'<{tag} class="h {kind_class}">{body}</{tag}>'
     if hunk["block_type"] == "listitem":
-        body = "•&nbsp;&nbsp;" + body
+        marker = html_mod.escape(hunk.get("marker", "•"))
+        body = f"{marker}&nbsp;&nbsp;" + body
     return f'<div class="blk {kind_class}">{body}</div>'
 
 

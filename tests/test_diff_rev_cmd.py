@@ -207,6 +207,22 @@ class TestRevOutput:
         )
 
     @_patches
+    def test_json_confirmation_for_artifact(
+        self, _pf, _list, _export, _info, _update, capsys, tmp_path,
+    ):
+        # --json with an artifact write prints a machine confirmation
+        out_path = tmp_path / "diff.html"
+        rc = cmd_diff(_make_args(rev="1..20", json=True, out=str(out_path)))
+        assert rc == 1
+        data = json.loads(capsys.readouterr().out)
+        assert data["ok"] is True
+        assert data["path"] == str(out_path)
+        assert data["format"] == "html"
+        assert data["changed"] >= 1
+        assert data["identical"] is False
+        assert out_path.exists()
+
+    @_patches
     def test_docx_write_error_exits_3(
         self, _pf, _list, _export, _info, _update, tmp_path,
     ):
@@ -248,20 +264,9 @@ class TestRevValidation:
             cmd_diff(_make_args(rev="1..20", format="color", out="x.html"))
         assert exc_info.value.exit_code == 3
 
-    def test_json_flag_with_rich_format(self):
-        with pytest.raises(GdocError, match="mutually exclusive") as exc_info:
-            cmd_diff(_make_args(rev="1..20", json=True, format="docx"))
-        assert exc_info.value.exit_code == 3
-
     def test_json_flag_with_terminal_format(self):
         with pytest.raises(GdocError, match="mutually exclusive") as exc_info:
             cmd_diff(_make_args(rev="1..20", json=True, format="color"))
-        assert exc_info.value.exit_code == 3
-
-    def test_json_flag_with_inferred_artifact_blames_out(self):
-        # format came from --out, so the error must not name --format
-        with pytest.raises(GdocError, match=r"--out") as exc_info:
-            cmd_diff(_make_args(rev="1..20", json=True, out="x.html"))
         assert exc_info.value.exit_code == 3
 
     def test_plain_flag_with_color_format(self):
