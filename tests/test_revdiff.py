@@ -237,17 +237,22 @@ class TestBuildHunks:
         assert [h["kind"] for h in hunks] == ["equal"]
 
     def test_heading_level_change_is_a_diff(self):
+        # delete+insert, not replace: a replace hunk here would carry
+        # only equal runs and render invisibly, and the old marker
+        # would never be shown
         hunks = build_hunks(
             "## Same heading text here\n", "### Same heading text here\n",
         )
-        assert [h["kind"] for h in hunks] == ["replace"]
+        assert [h["kind"] for h in hunks] == ["delete", "insert"]
+        assert [h["level"] for h in hunks] == [2, 3]
 
     def test_paragraph_to_bullet_is_a_diff(self):
         hunks = build_hunks(
             "The same sentence either way.\n",
             "- The same sentence either way.\n",
         )
-        assert [h["kind"] for h in hunks] == ["replace"]
+        assert [h["kind"] for h in hunks] == ["delete", "insert"]
+        assert [h["block_type"] for h in hunks] == ["paragraph", "listitem"]
 
     def test_ordered_list_renumbering_stays_equal(self):
         hunks = build_hunks(
@@ -255,6 +260,13 @@ class TestBuildHunks:
             "3\\. The same item text here.\n",
         )
         assert [h["kind"] for h in hunks] == ["equal"]
+
+    def test_bullet_to_ordered_is_a_diff(self):
+        hunks = build_hunks(
+            "- The same item text here.\n",
+            "1\\. The same item text here.\n",
+        )
+        assert [h["kind"] for h in hunks] == ["delete", "insert"]
 
 
 def _comment(cid, quoted, content="note", author="Alice",

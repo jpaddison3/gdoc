@@ -242,6 +242,29 @@ def strip_marker(block: str) -> str:
     return block
 
 
+def _block_structure(block: str) -> tuple:
+    """Structure key for same-text equality: type, level, list shape.
+
+    Distinguishes heading levels and bullet vs ordered lists, but not
+    the ordinal of an ordered item, so renumbering reads as equal.
+    (List nesting depth can't be tracked here: load_blocks strips
+    leading whitespace.)
+    """
+    block_type = classify_block(block)
+    if block_type == "heading":
+        return ("heading", heading_level(block))
+    if block_type == "listitem":
+        match = re.match(
+            rf"^\s*({_BULLET_MARK}|{_ORDERED_MARK})\s", block,
+        )
+        kind = (
+            "ordered" if match and match.group(1)[0].isdigit()
+            else "bullet"
+        )
+        return ("listitem", kind)
+    return ("paragraph",)
+
+
 # -------------------------------------------------------------- word diff
 
 def word_diff_runs(
@@ -312,22 +335,6 @@ def _make_hunk(
     new_text = (
         clean_text(strip_marker(new_block)) if new_block is not None else ""
     )
-    if kind in ("equal", "replace"):
-        # Alignment pairs blocks loosely (case-insensitive), so a pair
-        # can arrive here either way; the final kind depends on what a
-        # reader actually sees: the cleaned text plus the block
-        # structure (so a heading-level or paragraph→bullet change is
-        # a diff, while ordered-list renumbering is not).
-        same_structure = (
-            old_block is not None
-            and new_block is not None
-            and classify_block(old_block) == classify_block(new_block)
-            and heading_level(old_block) == heading_level(new_block)
-        )
-        kind = (
-            "equal" if old_text == new_text and same_structure
-            else "replace"
-        )
     hunk: dict = {"kind": kind, "block_type": block_type}
     if block_type == "heading":
         hunk["level"] = heading_level(src)
@@ -340,6 +347,29 @@ def _make_hunk(
     else:
         hunk["runs"] = word_diff_runs(old_text, new_text, min_common)
     return hunk
+
+
+def _pair_hunks(old_block: str, new_block: str, min_common: int) -> list[dict]:
+    """Hunks for an aligned old/new block pair.
+
+    Alignment pairs blocks loosely (case-insensitive), so a pair can
+    arrive looking equal or changed either way; the final kind depends
+    on what a reader actually sees — the cleaned text plus the block
+    structure. A marker-only change (heading level, paragraph→bullet)
+    becomes delete+insert: a replace hunk would carry only equal runs
+    and render with no visible difference, and this way the old marker
+    is shown too. Ordered-list renumbering still reads as equal.
+    """
+    old_text = clean_text(strip_marker(old_block))
+    new_text = clean_text(strip_marker(new_block))
+    if old_text != new_text:
+        return [_make_hunk("replace", old_block, new_block, min_common)]
+    if _block_structure(old_block) == _block_structure(new_block):
+        return [_make_hunk("equal", old_block, new_block, min_common)]
+    return [
+        _make_hunk("delete", old_block, None, min_common),
+        _make_hunk("insert", None, new_block, min_common),
+    ]
 
 
 def build_hunks(
@@ -357,9 +387,8 @@ def build_hunks(
     for op, i1, i2, j1, j2 in matcher.get_opcodes():
         if op == "equal":
             for k in range(i2 - i1):
-                hunks.append(_make_hunk(
-                    "equal", old_blocks[i1 + k], new_blocks[j1 + k],
-                    min_common,
+                hunks.extend(_pair_hunks(
+                    old_blocks[i1 + k], new_blocks[j1 + k], min_common,
                 ))
         elif op == "delete":
             for k in range(i1, i2):
@@ -379,7 +408,7 @@ def build_hunks(
                 o = old_chunk[k] if k < len(old_chunk) else None
                 n = new_chunk[k] if k < len(new_chunk) else None
                 if o is not None and n is not None:
-                    hunks.append(_make_hunk("replace", o, n, min_common))
+                    hunks.extend(_pair_hunks(o, n, min_common))
                 elif o is not None:
                     hunks.append(_make_hunk("delete", o, None, min_common))
                 else:
