@@ -544,7 +544,7 @@ def _insert_table(
             return
 
         # Parse each cell's markdown to plain text + inline styles, once.
-        from gdoc.mdparse import StyleRange, _parse_inline, _text_style_fields
+        from gdoc.mdparse import StyleRange, parse_inline, text_style_fields
 
         parsed_cells: dict[tuple[int, int], tuple[str, list]] = {}
         for r_idx, row in enumerate(cell_indices):
@@ -553,7 +553,7 @@ def _insert_table(
                 if r_idx < len(table.rows) and c_idx < len(table.rows[r_idx]):
                     raw = table.rows[r_idx][c_idx]
                 parsed_cells[(r_idx, c_idx)] = (
-                    _parse_inline(raw) if raw else ("", [])
+                    parse_inline(raw) if raw else ("", [])
                 )
 
         # Step 3: Insert cell plain text (reverse order, so the original cell
@@ -600,7 +600,7 @@ def _insert_table(
                         "updateTextStyle": {
                             "range": style_range,
                             "textStyle": s.style,
-                            "fields": _text_style_fields(s.style),
+                            "fields": text_style_fields(s.style),
                         }
                     })
                 shift += len(plain)
@@ -902,6 +902,26 @@ def _tab_body_range(body: dict) -> tuple[int, int]:
     return (1, last_end - 1)
 
 
+def _strip_trailing_newline_unless_hr(parsed) -> None:
+    """Drop the trailing \\n parse_markdown appends — the existing paragraph at
+    the insertion point already owns one, so without this every write leaves an
+    extra blank line. Skipped when the last paragraph is a horizontal rule (an
+    intentionally-empty paragraph whose border is lost if its only character is
+    removed). Mutates ``parsed`` in place.
+    """
+    old_len = len(parsed.plain_text)
+    last_is_hr = any(
+        s.type == "paragraph_style" and s.end == old_len
+        and "borderBottom" in s.style
+        for s in parsed.styles
+    )
+    if parsed.plain_text.endswith("\n") and not last_is_hr:
+        parsed.plain_text = parsed.plain_text[:-1]
+        for s in parsed.styles:
+            if s.end == old_len:
+                s.end = old_len - 1
+
+
 def insert_markdown_into_tab(
     doc_id: str,
     tab_name: str,
@@ -946,21 +966,7 @@ def insert_markdown_into_tab(
 
     parsed = parse_markdown(markdown)
 
-    # Strip trailing \n \u2014 the existing paragraph already owns one. Without
-    # this, every insert leaves an extra blank line behind. But skip the strip
-    # when the last paragraph is a horizontal rule (an intentionally-empty
-    # paragraph whose border is lost if its only character is removed).
-    old_len = len(parsed.plain_text)
-    last_is_hr = any(
-        s.type == "paragraph_style" and s.end == old_len
-        and "borderBottom" in s.style
-        for s in parsed.styles
-    )
-    if parsed.plain_text.endswith("\n") and not last_is_hr:
-        parsed.plain_text = parsed.plain_text[:-1]
-        for s in parsed.styles:
-            if s.end == old_len:
-                s.end = old_len - 1
+    _strip_trailing_newline_unless_hr(parsed)
 
     requests: list[dict] = []
 
@@ -1035,21 +1041,7 @@ def replace_formatted(
 
     parsed = parse_markdown(new_markdown)
 
-    # Strip trailing \n \u2014 the existing paragraph in the document already has
-    # one.  Without this, every replacement inserts an extra paragraph break.
-    # But skip the strip when the last paragraph is a horizontal rule (an
-    # intentionally-empty paragraph whose border is lost if stripped).
-    old_len = len(parsed.plain_text)
-    last_is_hr = any(
-        s.type == "paragraph_style" and s.end == old_len
-        and "borderBottom" in s.style
-        for s in parsed.styles
-    )
-    if parsed.plain_text.endswith("\n") and not last_is_hr:
-        parsed.plain_text = parsed.plain_text[:-1]
-        for s in parsed.styles:
-            if s.end == old_len:
-                s.end = old_len - 1
+    _strip_trailing_newline_unless_hr(parsed)
 
     # Sort matches by startIndex descending (last-to-first)
     sorted_matches = sorted(

@@ -143,6 +143,16 @@ def _strip_escapes(s: str) -> str:
     return "".join(out)
 
 
+def parse_inline(text: str) -> tuple[str, list[StyleRange]]:
+    """Public: parse inline formatting from a single string.
+
+    For callers (e.g. table-cell rendering) that need inline parsing without
+    the block-level handling of `parse_markdown`. Returns (plain_text,
+    style_ranges) with offsets relative to plain_text.
+    """
+    return _parse_inline(text)
+
+
 def _parse_inline(text: str) -> tuple[str, list[StyleRange]]:
     """Parse inline formatting from a text string.
 
@@ -546,6 +556,11 @@ def to_docs_requests(
         removed += leading
 
     return requests
+
+
+def text_style_fields(style: dict) -> str:
+    """Public: build the updateTextStyle `fields` mask for a style dict."""
+    return _text_style_fields(style)
 
 
 def _text_style_fields(style: dict) -> str:
