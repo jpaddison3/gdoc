@@ -28,7 +28,8 @@ All notable changes to `gdoc` are documented here. This project follows
   URL as the source: `cat --comments`/`--revision`,
   `write --force-collapse-tabs`.
 - `pull`/`push` ignore a URL tab (they round-trip the whole document) but print
-  a one-line stderr `NOTE:` when discarding a non-`t.0` tab.
+  a one-line stderr `NOTE:` when discarding a non-`t.0` tab (suppressed under
+  `--quiet`).
 - Spreadsheet `#gid=` deep links are still unparsed — select a worksheet with
   `--tab`/`--range`.
 

@@ -163,6 +163,21 @@ class TestInsertUrlTab:
             cmd_insert(args)
         assert exc.value.exit_code == 3
 
+    def test_url_t0_errors_with_ambient_hint(self, tmp_path):
+        # ?tab=t.0 collapses to "no tab", but the error names t.0 as the
+        # ignored ambient default rather than telling the user to pass a URL
+        # ?tab= (which they already did).
+        f = tmp_path / "content.md"
+        f.write_text("# Hello")
+        args = _make_args(
+            file=str(f),
+            doc="https://docs.google.com/document/d/abc123/edit?tab=t.0",
+            tab=None,
+        )
+        with pytest.raises(GdocError, match="ambient default") as exc:
+            cmd_insert(args)
+        assert exc.value.exit_code == 3
+
     @patch("gdoc.state.update_state_after_command")
     @patch("gdoc.api.drive.get_file_version", return_value={"version": 11})
     @patch("gdoc.api.docs.insert_markdown_into_tab", return_value=_insert_result())
