@@ -288,6 +288,24 @@ class TestCatUrlTab:
             cmd_cat(args)
         assert exc.value.exit_code == 3
 
+    @patch("gdoc.state.update_state_after_command")
+    @patch("gdoc.notify.pre_flight", return_value=None)
+    @patch("gdoc.api.docs.get_tab_text", return_value="first tab\n")
+    @patch("gdoc.api.docs.get_document_tabs")
+    @patch("gdoc.api.docs.get_docs_service")
+    def test_flag_t0_forces_first_tab(
+        self, _svc, mock_tabs, mock_text, _pf, _update, capsys,
+    ):
+        """Explicit --tab t.0 is the escape hatch: read the literal first tab
+        via the Docs API rather than treating t.0 as ambient noise."""
+        mock_tabs.return_value = [_tab("t.0", "First"), _tab("t.second", "Second")]
+        args = _make_args(tab="t.0")
+        with patch("gdoc.api.drive.export_doc") as mock_export:
+            rc = cmd_cat(args)
+        assert rc == 0
+        assert mock_text.call_args[0][0]["id"] == "t.0"
+        mock_export.assert_not_called()
+
 
 class TestCatTabAwareness:
     @patch("gdoc.state.update_state_after_command")

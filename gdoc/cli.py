@@ -8,6 +8,12 @@ from gdoc import __version__
 from gdoc.revdiff import DEFAULT_CONTEXT, DEFAULT_MIN_COMMON
 from gdoc.util import SPREADSHEET_MIME, AuthError, GdocError
 
+# Google's editor auto-appends ``?tab=t.0`` (the first tab) to every doc URL,
+# so a URL tab of ``t.0`` is treated as ambient noise, not an intentional
+# selection. This sentinel is the load-bearing heuristic of URL-tab handling;
+# name it once so the call sites can't drift.
+_FIRST_TAB_ID = "t.0"
+
 
 class GdocArgumentParser(argparse.ArgumentParser):
     """Custom parser that exits with code 3 on usage errors (not 2)."""
@@ -32,12 +38,7 @@ def _truncate_bytes(text: str, max_bytes: int) -> str:
 
 def _resolve_doc_id(raw: str) -> str:
     """Extract doc ID, wrapping ValueError as GdocError(exit_code=3)."""
-    from gdoc.util import extract_doc_id
-
-    try:
-        return extract_doc_id(raw)
-    except ValueError as e:
-        raise GdocError(str(e), exit_code=3)
+    return _resolve_doc_ref(raw)[0]
 
 
 def _resolve_doc_ref(raw: str) -> tuple[str, str | None]:
@@ -70,23 +71,27 @@ def _effective_tab(
         return flag_tab, False
     if all_tabs:
         return None, False
-    if url_tab is not None and url_tab != "t.0":
+    if url_tab is not None and url_tab != _FIRST_TAB_ID:
         return url_tab, True
     return None, False
 
 
-def _note_discarded_url_tab(url_tab: str | None, command: str) -> None:
+def _note_discarded_url_tab(
+    url_tab: str | None, command: str, quiet: bool = False
+) -> None:
     """Print a stderr NOTE when a whole-document command drops a URL's tab.
 
-    Silent for the ambient ``t.0`` (Google auto-appends it) and when no tab
-    was present. ``command`` names the operation for the message.
+    Silent for the ambient ``t.0`` (Google auto-appends it), when no tab was
+    present, and under ``--quiet`` (the established switch for suppressing
+    stderr chatter). ``command`` names the operation for the message.
     """
-    if url_tab and url_tab != "t.0":
-        print(
-            f"NOTE: ignoring tab {url_tab!r} from the URL; {command} operates "
-            "on the whole document",
-            file=sys.stderr,
-        )
+    if quiet or not url_tab or url_tab == _FIRST_TAB_ID:
+        return
+    print(
+        f"NOTE: ignoring tab {url_tab!r} from the URL; {command} operates "
+        "on the whole document",
+        file=sys.stderr,
+    )
 
 
 def _file_mime(doc_id: str, change_info) -> str:
@@ -334,7 +339,7 @@ def cmd_cat(args) -> int:
 
     revision = getattr(args, "revision", None)
     if revision and (tab or all_tabs or getattr(args, "comments", False)):
-        if tab_from_url and tab:
+        if tab_from_url:
             raise GdocError(
                 f"the URL targets tab {tab!r}, but --revision reads the whole "
                 "document; drop ?tab= from the URL to view a revision",
@@ -739,6 +744,13 @@ def cmd_insert(args) -> int:
     force = getattr(args, "force", False)
     tab_name, _ = _effective_tab(url_tab, getattr(args, "tab", None))
     if not tab_name:
+        if url_tab == _FIRST_TAB_ID:
+            raise GdocError(
+                "the URL's ?tab=t.0 is the first tab, which is ignored as an "
+                "ambient default; pass --tab NAME to target a specific tab "
+                "(or --tab t.0 for the first tab explicitly)",
+                exit_code=3,
+            )
         raise GdocError(
             "--tab is required (or pass a URL with ?tab=)", exit_code=3,
         )
@@ -1457,8 +1469,8 @@ def cmd_write(args) -> int:
 def cmd_pull(args) -> int:
     """Handler for `gdoc pull`."""
     doc_id, url_tab = _resolve_doc_ref(args.doc)
-    _note_discarded_url_tab(url_tab, "pull")
     quiet = getattr(args, "quiet", False)
+    _note_discarded_url_tab(url_tab, "pull", quiet)
     file_path = args.file
     revision = getattr(args, "revision", None)
 
@@ -1583,7 +1595,7 @@ def cmd_push(args) -> int:
         )
 
     doc_id, url_tab = _resolve_doc_ref(metadata["gdoc"])
-    _note_discarded_url_tab(url_tab, "push")
+    _note_discarded_url_tab(url_tab, "push", quiet)
 
     # Conflict detection (reuse shared helper)
     change_info, in_sync = _check_write_conflict(doc_id, quiet, force, body=body)

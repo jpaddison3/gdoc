@@ -309,3 +309,26 @@ class TestPullUrlTab:
         rc = cmd_pull(args)
         assert rc == 0
         assert "NOTE" not in capsys.readouterr().err
+
+    @patch("gdoc.state.update_state_after_command")
+    @patch("gdoc.api.drive.get_drive_service")
+    @patch(
+        "gdoc.api.drive.get_file_info",
+        return_value={"name": "My Doc", "version": 42},
+    )
+    @patch("gdoc.api.drive.export_doc", return_value="# Hello\n")
+    @patch("gdoc.notify.pre_flight", return_value=ChangeInfo(current_version=42))
+    def test_quiet_suppresses_note(
+        self, _pf, _export, _info, _drv, _update, tmp_path, capsys,
+    ):
+        # --quiet is the established "be silent on stderr" switch; the
+        # tab-discard NOTE honors it like other stderr chatter.
+        f = tmp_path / "out.md"
+        args = _make_args(
+            file=str(f),
+            doc="https://docs.google.com/document/d/abc123/edit?tab=t.second",
+            quiet=True,
+        )
+        rc = cmd_pull(args)
+        assert rc == 0
+        assert "NOTE" not in capsys.readouterr().err
