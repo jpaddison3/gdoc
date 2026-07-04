@@ -206,6 +206,89 @@ class TestCatTabMutualExclusivity:
             cmd_cat(args)
 
 
+_URL = "https://docs.google.com/document/d/abc123/edit"
+
+
+class TestCatUrlTab:
+    @patch("gdoc.state.update_state_after_command")
+    @patch("gdoc.notify.pre_flight", return_value=None)
+    @patch("gdoc.api.docs.get_tab_text", return_value="tab body\n")
+    @patch("gdoc.api.docs.get_document_tabs")
+    @patch("gdoc.api.docs.get_docs_service")
+    def test_url_tab_routes_to_docs_api(
+        self, _svc, mock_tabs, mock_text, _pf, _update, capsys,
+    ):
+        """A non-t.0 ?tab= in the URL is honored like --tab."""
+        mock_tabs.return_value = [_tab("t.second", "Second")]
+        args = _make_args(doc=f"{_URL}?tab=t.second")
+        with patch("gdoc.api.drive.export_doc") as mock_export:
+            rc = cmd_cat(args)
+            mock_export.assert_not_called()
+        assert rc == 0
+        assert capsys.readouterr().out == "tab body\n"
+        mock_tabs.assert_called_once_with("abc123")
+
+    @patch("gdoc.state.update_state_after_command")
+    @patch("gdoc.notify.pre_flight", return_value=None)
+    def test_url_tab_t0_stays_on_drive_export(self, _pf, _update, capsys):
+        """?tab=t.0 is ambient noise: stay on the high-fidelity Drive path."""
+        args = _make_args(doc=f"{_URL}?tab=t.0")
+        with patch(
+            "gdoc.api.drive.export_doc", return_value="whole doc\n"
+        ) as mock_export, patch("gdoc.api.docs.get_document_tabs") as mock_tabs:
+            rc = cmd_cat(args)
+            mock_export.assert_called_once()
+            mock_tabs.assert_not_called()
+        assert rc == 0
+        assert capsys.readouterr().out == "whole doc\n"
+
+    @patch("gdoc.state.update_state_after_command")
+    @patch("gdoc.notify.pre_flight", return_value=None)
+    @patch("gdoc.api.docs.get_tab_text", return_value="flag body\n")
+    @patch("gdoc.api.docs.get_document_tabs")
+    @patch("gdoc.api.docs.get_docs_service")
+    def test_flag_overrides_url_tab(
+        self, _svc, mock_tabs, mock_text, _pf, _update, capsys,
+    ):
+        """An explicit --tab wins over a differing URL tab."""
+        mock_tabs.return_value = [_tab("t.second", "Second"), _tab("t.flag", "Flag")]
+        args = _make_args(doc=f"{_URL}?tab=t.second", tab="Flag")
+        rc = cmd_cat(args)
+        assert rc == 0
+        called_tab = mock_text.call_args[0][0]
+        assert called_tab["id"] == "t.flag"
+
+    @patch("gdoc.state.update_state_after_command")
+    @patch("gdoc.notify.pre_flight", return_value=None)
+    @patch("gdoc.api.docs.get_tab_text")
+    @patch("gdoc.api.docs.get_document_tabs")
+    @patch("gdoc.api.docs.get_docs_service")
+    def test_all_tabs_overrides_url_tab(
+        self, _svc, mock_tabs, mock_text, _pf, _update, capsys,
+    ):
+        """--all-tabs wins over a URL tab (no conflict error)."""
+        mock_tabs.return_value = [_tab("t1", "First"), _tab("t.second", "Second")]
+        mock_text.side_effect = ["a\n", "b\n"]
+        args = _make_args(doc=f"{_URL}?tab=t.second", all_tabs=True)
+        rc = cmd_cat(args)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "=== Tab: First ===" in out
+        assert "=== Tab: Second ===" in out
+
+    def test_url_tab_and_comments_conflict_mentions_url(self):
+        args = _make_args(doc=f"{_URL}?tab=t.second", comments=True, quiet=True)
+        with pytest.raises(GdocError, match="URL targets tab") as exc:
+            cmd_cat(args)
+        assert exc.value.exit_code == 3
+
+    def test_url_tab_and_revision_conflict_mentions_url(self):
+        args = _make_args(doc=f"{_URL}?tab=t.second", revision="latest", quiet=True)
+        with pytest.raises(GdocError, match="URL targets tab") as exc:
+            cmd_cat(args)
+        assert exc.value.exit_code == 3
+
+
 class TestCatTabAwareness:
     @patch("gdoc.state.update_state_after_command")
     @patch("gdoc.notify.pre_flight")

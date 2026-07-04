@@ -378,6 +378,21 @@ gdoc cat --all-tabs DOC
 
 `--tab` and `--all-tabs` are mutually exclusive with `--comments`. They work with `--json` and `--plain`.
 
+### Tabs in the URL
+
+Google's editor deep-links to a tab with a `?tab=<id>` query param (e.g. `.../edit?tab=t.abc123`). `gdoc` honors it: a pasted tab URL acts exactly as if you'd passed `--tab <id>`, so `cat`, `edit`, `write`, `insert`, and `toc` all operate on that tab.
+
+```bash
+# Reads the "Notes" tab — same as `gdoc cat --tab t.abc123 DOC`
+gdoc cat 'https://docs.google.com/document/d/DOC/edit?tab=t.abc123'
+```
+
+One special case: the editor auto-appends `?tab=t.0` to the address bar for the **first** tab, so it's ambient UI noise rather than an intentional selection. `gdoc` therefore treats `?tab=t.0` as if no tab were given — the common pasted URL stays on the high-fidelity Drive export path. To force the Docs-API read of the literal first tab, pass `--tab t.0` explicitly.
+
+Precedence: an explicit `--tab` (or `cat --all-tabs`) always overrides the URL. Combining a URL tab with a whole-document flag is an error (`cat --comments`/`--revision`, `write --force-collapse-tabs`) — the message names the URL so you know to drop `?tab=`. Whole-document commands that can't target a tab (`pull`, `push`) ignore a URL tab but print a one-line `NOTE:` to stderr when they do (silent for `t.0`).
+
+> **Spreadsheets:** Sheets deep-links use `#gid=<n>`, which `gdoc` does not yet parse — select a worksheet with `--tab`/`--range` instead.
+
 ## Byte truncation
 
 Use `--max-bytes` on `cat` to limit output size. Truncation is UTF-8-safe (never splits a multi-byte character):

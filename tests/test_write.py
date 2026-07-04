@@ -846,3 +846,65 @@ class TestWriteTabScoped:
         uploaded = mock_insert.call_args.args[2]
         assert "---" not in uploaded
         assert uploaded.startswith("# Real body")
+
+
+class TestWriteUrlTab:
+    """A ?tab= in the document URL drives the per-tab write path."""
+
+    @patch("gdoc.state.update_state_after_command")
+    @patch("gdoc.api.drive.get_file_version", return_value={"version": 11})
+    @patch("gdoc.api.drive.update_doc_content")
+    @patch("gdoc.api.docs.insert_markdown_into_tab")
+    @patch("gdoc.notify.pre_flight")
+    def test_url_tab_writes_single_tab(
+        self, mock_pf, mock_insert, mock_update_doc, _ver, mock_state, tmp_path,
+    ):
+        f = tmp_path / "doc.md"
+        f.write_text("# New body\n")
+        mock_pf.return_value = ChangeInfo(
+            current_version=10, last_read_version=10,
+        )
+        mock_insert.return_value = {
+            "tab_id": "t.second", "tab_title": "Second", "insert_index": 1,
+        }
+        args = _make_args(
+            file=str(f),
+            doc="https://docs.google.com/document/d/abc123/edit?tab=t.second",
+        )
+        rc = cmd_write(args)
+        assert rc == 0
+        mock_insert.assert_called_once_with(
+            "abc123", "t.second", "# New body\n", replace=True,
+        )
+        mock_update_doc.assert_not_called()
+        assert mock_state.call_args.kwargs["full_doc_write"] is False
+
+    def test_url_tab_and_force_collapse_conflict(self, tmp_path):
+        args = _make_args(
+            doc="https://docs.google.com/document/d/abc123/edit?tab=t.second",
+            force_collapse_tabs=True,
+            quiet=True,
+        )
+        with pytest.raises(GdocError, match="URL targets tab") as exc:
+            cmd_write(args)
+        assert exc.value.exit_code == 3
+
+    @patch("gdoc.state.update_state_after_command")
+    @patch("gdoc.api.drive.update_doc_content", return_value=42)
+    @patch("gdoc.notify.pre_flight")
+    def test_url_tab_t0_uses_whole_doc(
+        self, mock_pf, mock_update_doc, _update, tmp_path,
+    ):
+        """?tab=t.0 is ambient noise: whole-doc write, collapse guard intact."""
+        f = tmp_path / "doc.md"
+        f.write_text("content")
+        mock_pf.return_value = ChangeInfo(
+            current_version=10, last_read_version=10,
+        )
+        args = _make_args(
+            file=str(f),
+            doc="https://docs.google.com/document/d/abc123/edit?tab=t.0",
+        )
+        rc = cmd_write(args)
+        assert rc == 0
+        mock_update_doc.assert_called_once()

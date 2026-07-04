@@ -133,6 +133,54 @@ class TestInsertFileErrors:
         assert exc.value.exit_code == 3
 
 
+class TestInsertUrlTab:
+    @patch("gdoc.state.update_state_after_command")
+    @patch("gdoc.api.drive.get_file_version", return_value={"version": 11})
+    @patch("gdoc.api.docs.insert_markdown_into_tab", return_value=_insert_result())
+    @patch("gdoc.notify.pre_flight", return_value=_preflight_ok())
+    def test_url_tab_satisfies_requirement(
+        self, _pf, mock_insert, _ver, _update, tmp_path,
+    ):
+        f = tmp_path / "content.md"
+        f.write_text("# Hello")
+        args = _make_args(
+            file=str(f),
+            doc="https://docs.google.com/document/d/abc123/edit?tab=t.second",
+            tab=None,
+        )
+        rc = cmd_insert(args)
+        assert rc == 0
+        mock_insert.assert_called_once_with(
+            "abc123", "t.second", "# Hello",
+            position="start", replace=False,
+        )
+
+    def test_no_tab_anywhere_errors(self, tmp_path):
+        f = tmp_path / "content.md"
+        f.write_text("# Hello")
+        args = _make_args(file=str(f), doc="abc123", tab=None)
+        with pytest.raises(GdocError, match="--tab is required") as exc:
+            cmd_insert(args)
+        assert exc.value.exit_code == 3
+
+    @patch("gdoc.state.update_state_after_command")
+    @patch("gdoc.api.drive.get_file_version", return_value={"version": 11})
+    @patch("gdoc.api.docs.insert_markdown_into_tab", return_value=_insert_result())
+    @patch("gdoc.notify.pre_flight", return_value=_preflight_ok())
+    def test_flag_overrides_url_tab(
+        self, _pf, mock_insert, _ver, _update, tmp_path,
+    ):
+        f = tmp_path / "content.md"
+        f.write_text("# Hello")
+        args = _make_args(
+            file=str(f),
+            doc="https://docs.google.com/document/d/abc123/edit?tab=t.second",
+            tab="Explicit",
+        )
+        cmd_insert(args)
+        assert mock_insert.call_args.args[1] == "Explicit"
+
+
 class TestInsertConflict:
     @patch("gdoc.api.drive.get_file_version", return_value={"version": 11})
     @patch("gdoc.api.docs.insert_markdown_into_tab")

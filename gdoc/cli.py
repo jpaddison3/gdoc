@@ -40,6 +40,54 @@ def _resolve_doc_id(raw: str) -> str:
         raise GdocError(str(e), exit_code=3)
 
 
+def _resolve_doc_ref(raw: str) -> tuple[str, str | None]:
+    """Extract (doc ID, URL tab ID), wrapping ValueError as GdocError(3)."""
+    from gdoc.util import extract_doc_ref
+
+    try:
+        return extract_doc_ref(raw)
+    except ValueError as e:
+        raise GdocError(str(e), exit_code=3)
+
+
+def _effective_tab(
+    url_tab: str | None,
+    flag_tab: str | None,
+    all_tabs: bool = False,
+) -> tuple[str | None, bool]:
+    """Merge a URL's ?tab= value with an explicit --tab flag.
+
+    Rules:
+    - An explicit --tab flag (or --all-tabs) always wins over the URL.
+    - A URL tab of ``t.0`` is treated as absent — Google's editor
+      auto-appends it, so it is ambient UI noise, not an intentional
+      selection. Escape hatch: pass ``--tab t.0`` explicitly.
+
+    Returns (effective_tab, from_url) where from_url is True when the
+    returned tab originated from the URL (used to tailor error wording).
+    """
+    if flag_tab is not None:
+        return flag_tab, False
+    if all_tabs:
+        return None, False
+    if url_tab is not None and url_tab != "t.0":
+        return url_tab, True
+    return None, False
+
+
+def _note_discarded_url_tab(url_tab: str | None, command: str) -> None:
+    """Print a stderr NOTE when a whole-document command drops a URL's tab.
+
+    Silent for the ambient ``t.0`` (Google auto-appends it) and when no tab
+    was present. ``command`` names the operation for the message.
+    """
+    if url_tab and url_tab != "t.0":
+        print(
+            f"NOTE: ignoring tab {url_tab!r} from the URL; {command} operates "
+            "on the whole document",
+            file=sys.stderr,
+        )
+
 
 def _file_mime(doc_id: str, change_info) -> str:
     """Get the file's mimeType, reusing the pre-flight metadata when available."""
@@ -258,16 +306,24 @@ def cmd_revisions(args) -> int:
 
 def cmd_cat(args) -> int:
     """Handler for `gdoc cat`."""
-    doc_id = _resolve_doc_id(args.doc)
+    doc_id, url_tab = _resolve_doc_ref(args.doc)
 
     quiet = getattr(args, "quiet", False)
-    tab = getattr(args, "tab", None)
     all_tabs = getattr(args, "all_tabs", False)
+    tab, tab_from_url = _effective_tab(
+        url_tab, getattr(args, "tab", None), all_tabs
+    )
 
     if getattr(args, "comments", False) and getattr(args, "plain", False):
         raise GdocError("--comments and --plain are mutually exclusive", exit_code=3)
 
     if (tab or all_tabs) and getattr(args, "comments", False):
+        if tab_from_url:
+            raise GdocError(
+                f"the URL targets tab {tab!r}, but --comments reads the whole "
+                "document; drop ?tab= from the URL to view comments",
+                exit_code=3,
+            )
         raise GdocError(
             "--tab/--all-tabs and --comments are mutually exclusive",
             exit_code=3,
@@ -278,6 +334,12 @@ def cmd_cat(args) -> int:
 
     revision = getattr(args, "revision", None)
     if revision and (tab or all_tabs or getattr(args, "comments", False)):
+        if tab_from_url and tab:
+            raise GdocError(
+                f"the URL targets tab {tab!r}, but --revision reads the whole "
+                "document; drop ?tab= from the URL to view a revision",
+                exit_code=3,
+            )
         raise GdocError(
             "--revision cannot be combined with "
             "--tab/--all-tabs/--comments",
@@ -510,9 +572,9 @@ def cmd_tabs(args) -> int:
 
 def cmd_toc(args) -> int:
     """Handler for `gdoc toc`."""
-    doc_id = _resolve_doc_id(args.doc)
+    doc_id, url_tab = _resolve_doc_ref(args.doc)
     quiet = getattr(args, "quiet", False)
-    tab = getattr(args, "tab", None)
+    tab, _ = _effective_tab(url_tab, getattr(args, "tab", None))
     max_depth = getattr(args, "max_depth", 0)
     no_links = getattr(args, "no_links", False)
 
@@ -672,10 +734,14 @@ def cmd_insert(args) -> int:
     """Handler for `gdoc insert`."""
     import os
 
-    doc_id = _resolve_doc_id(args.doc)
+    doc_id, url_tab = _resolve_doc_ref(args.doc)
     quiet = getattr(args, "quiet", False)
     force = getattr(args, "force", False)
-    tab_name = args.tab
+    tab_name, _ = _effective_tab(url_tab, getattr(args, "tab", None))
+    if not tab_name:
+        raise GdocError(
+            "--tab is required (or pass a URL with ?tab=)", exit_code=3,
+        )
     position = getattr(args, "position", "start")
     file_path = args.file
 
@@ -1009,7 +1075,7 @@ def _read_file(path: str) -> str:
 
 def cmd_edit(args) -> int:
     """Handler for `gdoc edit`."""
-    doc_id = _resolve_doc_id(args.doc)
+    doc_id, url_tab = _resolve_doc_ref(args.doc)
     quiet = getattr(args, "quiet", False)
     replace_all = getattr(args, "all", False)
     case_sensitive = getattr(args, "case_sensitive", False)
@@ -1095,7 +1161,7 @@ def cmd_edit(args) -> int:
     # Get document structure + revision ID
     from gdoc.api.docs import find_text_in_document, get_document, replace_formatted
 
-    tab_name = getattr(args, "tab", None)
+    tab_name, _ = _effective_tab(url_tab, getattr(args, "tab", None))
     tab_id = None
 
     if tab_name:
@@ -1297,12 +1363,21 @@ def cmd_write(args) -> int:
     """Handler for `gdoc write`."""
     import os
 
-    doc_id = _resolve_doc_id(args.doc)
+    doc_id, url_tab = _resolve_doc_ref(args.doc)
     quiet = getattr(args, "quiet", False)
     force = getattr(args, "force", False)
-    tab_name = getattr(args, "tab", None)
+    tab_name, tab_from_url = _effective_tab(url_tab, getattr(args, "tab", None))
     force_collapse = getattr(args, "force_collapse_tabs", False)
     file_path = args.file
+
+    # A URL that targets a tab and --force-collapse-tabs (collapse every tab
+    # into a single whole-doc write) express opposite intents.
+    if tab_from_url and force_collapse:
+        raise GdocError(
+            f"the URL targets tab {tab_name!r}, but --force-collapse-tabs "
+            "rewrites the whole document; drop ?tab= from the URL or the flag",
+            exit_code=3,
+        )
 
     # Read local file first (fail fast on missing file)
     if not os.path.isfile(file_path):
@@ -1381,7 +1456,8 @@ def cmd_write(args) -> int:
 
 def cmd_pull(args) -> int:
     """Handler for `gdoc pull`."""
-    doc_id = _resolve_doc_id(args.doc)
+    doc_id, url_tab = _resolve_doc_ref(args.doc)
+    _note_discarded_url_tab(url_tab, "pull")
     quiet = getattr(args, "quiet", False)
     file_path = args.file
     revision = getattr(args, "revision", None)
@@ -1506,7 +1582,8 @@ def cmd_push(args) -> int:
             exit_code=3,
         )
 
-    doc_id = _resolve_doc_id(metadata["gdoc"])
+    doc_id, url_tab = _resolve_doc_ref(metadata["gdoc"])
+    _note_discarded_url_tab(url_tab, "push")
 
     # Conflict detection (reuse shared helper)
     change_info, in_sync = _check_write_conflict(doc_id, quiet, force, body=body)
@@ -2787,7 +2864,9 @@ def build_parser() -> GdocArgumentParser:
         "cat", parents=[output_parent],
         help="Export doc as markdown (spreadsheets print as a table)",
     )
-    cat_p.add_argument("doc", help="Document ID or URL")
+    cat_p.add_argument(
+        "doc", help="Document ID or URL (a ?tab= in the URL selects that tab)"
+    )
     cat_p.add_argument(
         "--comments", action="store_true", help="Include comment annotations"
     )
@@ -2895,8 +2974,12 @@ def build_parser() -> GdocArgumentParser:
         "toc", parents=[output_parent],
         help="Extract table of contents with deep links",
     )
-    toc_p.add_argument("doc", help="Document ID or URL")
-    toc_p.add_argument("--tab", help="Read a specific tab by title or ID")
+    toc_p.add_argument(
+        "doc", help="Document ID or URL (a ?tab= in the URL selects that tab)"
+    )
+    toc_p.add_argument(
+        "--tab", help="Read a specific tab by title or ID (or pass a URL with ?tab=)"
+    )
     toc_p.add_argument(
         "--max-depth", type=int, default=0,
         help="Only show headings up to level N (0 = all)",
@@ -2930,7 +3013,9 @@ def build_parser() -> GdocArgumentParser:
                "Replacement text supports markdown formatting "
                "(bold, italic, headings, bullets, links).",
     )
-    edit_p.add_argument("doc", help="Document ID or URL")
+    edit_p.add_argument(
+        "doc", help="Document ID or URL (a ?tab= in the URL selects that tab)"
+    )
     edit_p.add_argument("old_text", nargs="?", default=None, help="Text to find")
     edit_p.add_argument("new_text", nargs="?", default=None, help="Replacement text")
     edit_p.add_argument("--old-file", help="Read old text from file")
@@ -2965,7 +3050,8 @@ def build_parser() -> GdocArgumentParser:
         "--quiet", action="store_true", help="Skip pre-flight checks"
     )
     edit_p.add_argument(
-        "--tab", help="Target a specific tab by title or ID"
+        "--tab",
+        help="Target a specific tab by title or ID (or pass a URL with ?tab=)",
     )
     edit_p.set_defaults(func=cmd_edit)
 
@@ -3041,11 +3127,14 @@ def build_parser() -> GdocArgumentParser:
             "automatically."
         ),
     )
-    write_p.add_argument("doc", help="Document ID or URL")
+    write_p.add_argument(
+        "doc", help="Document ID or URL (a ?tab= in the URL selects that tab)"
+    )
     write_p.add_argument("file", help="Local markdown file")
     write_p.add_argument(
         "--tab",
-        help="Replace only this tab (by title or ID); leaves siblings alone",
+        help="Replace only this tab (by title or ID, or a URL with ?tab=); "
+             "leaves siblings alone",
     )
     write_p.add_argument(
         "--force-collapse-tabs", action="store_true",
@@ -3069,11 +3158,13 @@ def build_parser() -> GdocArgumentParser:
             "before upload."
         ),
     )
-    insert_p.add_argument("doc", help="Document ID or URL")
+    insert_p.add_argument(
+        "doc", help="Document ID or URL (a ?tab= in the URL supplies the tab)"
+    )
     insert_p.add_argument("file", help="Local markdown file")
     insert_p.add_argument(
-        "--tab", required=True,
-        help="Target tab by title or ID",
+        "--tab",
+        help="Target tab by title or ID (or pass a URL with ?tab=)",
     )
     insert_p.add_argument(
         "--position", choices=["start", "end"], default="start",

@@ -4,6 +4,34 @@ All notable changes to `gdoc` are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] — 2026-07-04
+
+### Added
+- **Document URLs honor their `?tab=` deep link.** Google's editor appends
+  `?tab=<id>` when you open a tab, so a pasted tab URL now acts exactly like
+  `--tab <id>` for `cat`, `edit` (incl. `--cell`), `write`, `insert`, and
+  `toc` — previously the tab was silently dropped and the command operated on
+  the first tab (or whole doc). An explicit `--tab`/`--all-tabs` still
+  overrides the URL.
+
+### Changed
+- **`?tab=t.0` is treated as no tab.** The editor auto-appends `t.0` for the
+  first tab, so it's ambient UI noise; honoring it would push the common
+  pasted-URL case onto the lower-fidelity Docs-API renderer. It now stays on
+  the high-fidelity Drive export path. Escape hatch: pass `--tab t.0`
+  explicitly to force the literal first-tab read.
+- **`gdoc insert` no longer requires `--tab`** when the document URL already
+  carries a `?tab=`.
+
+### Notes
+- Combining a URL tab with a whole-document flag errors (exit 3) and names the
+  URL as the source: `cat --comments`/`--revision`,
+  `write --force-collapse-tabs`.
+- `pull`/`push` ignore a URL tab (they round-trip the whole document) but print
+  a one-line stderr `NOTE:` when discarding a non-`t.0` tab.
+- Spreadsheet `#gid=` deep links are still unparsed — select a worksheet with
+  `--tab`/`--range`.
+
 ## [0.12.0] — 2026-06-22
 
 ### Added
