@@ -393,24 +393,12 @@ def cmd_cat(args) -> int:
         return 0
 
     if tab or all_tabs:
-        from gdoc.api.docs import get_document_tabs, get_tab_text
+        from gdoc.api.docs import get_document_tabs, get_tab_text, resolve_tab
 
         tabs = get_document_tabs(doc_id)
 
         if tab:
-            # Match by title (case-insensitive) first, then by ID
-            match = None
-            for t in tabs:
-                if t["title"].lower() == tab.lower():
-                    match = t
-                    break
-            if match is None:
-                for t in tabs:
-                    if t["id"] == tab:
-                        match = t
-                        break
-            if match is None:
-                raise GdocError(f"tab not found: {tab}", exit_code=3)
+            match = resolve_tab(tabs, tab)
             content = get_tab_text(match)
             if no_images:
                 from gdoc.mdimport import strip_images
