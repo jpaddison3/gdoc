@@ -111,6 +111,12 @@ class TestExtractDocRef:
         )
         assert extract_doc_ref(url) == ("1aBcDeFg", "t.xyz")
 
+    def test_tab_suffixed_param_name_does_not_match(self):
+        # The [?&] anchor means a param whose *name* ends in "tab"
+        # (e.g. subtab=) must NOT be read as the tab id.
+        url = "https://docs.google.com/document/d/1aBcDeFg/edit?subtab=t.9"
+        assert extract_doc_ref(url) == ("1aBcDeFg", None)
+
     def test_bare_id_has_no_tab(self):
         assert extract_doc_ref("1aBcDeFgHiJkLmNoPqRsTuVwXyZ") == (
             "1aBcDeFgHiJkLmNoPqRsTuVwXyZ",
