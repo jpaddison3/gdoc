@@ -179,6 +179,34 @@ class TestTabBaselineDecision:
         mock_insert.assert_not_called()
 
     @patch("gdoc.state.update_state_after_command")
+    @patch("gdoc.api.drive.get_file_version", return_value={"version": 100})
+    @patch("gdoc.api.docs.insert_markdown_into_tab",
+           return_value={"tab_id": "t.x", "tab_title": "X", "insert_index": 1})
+    @patch("gdoc.api.docs.get_document_with_tabs")
+    @patch("gdoc.state.load_state")
+    @patch("gdoc.notify.pre_flight")
+    def test_nonquiet_write_succeeds_on_own_tab_baseline(
+        self, mock_pf, mock_load, mock_doc, mock_insert, _ver, _upd, tmp_path,
+    ):
+        """Non-quiet flagship happy path: with no whole-doc baseline, tab X
+        read at v100 and the doc still at v100, `write --tab X` succeeds — the
+        per-tab entry alone satisfies the guard. The non-quiet branch sources
+        the global part from pre_flight (None here) and the per-tab part from
+        state, so this locks that split, which the quiet success tests don't."""
+        f = tmp_path / "body.md"
+        f.write_text("# new\n")
+        mock_load.return_value = DocState(
+            last_read_version=None, tab_read_versions={"t.x": 100},
+        )
+        mock_pf.return_value = ChangeInfo(
+            current_version=100, last_read_version=None,
+        )
+        mock_doc.return_value = _doc_with_tabs(("t.x", "X"))
+        rc = cmd_write(_write_args("abc123", "X", str(f), quiet=False))
+        assert rc == 0
+        mock_insert.assert_called_once()
+
+    @patch("gdoc.state.update_state_after_command")
     @patch("gdoc.api.drive.get_file_version", return_value={"version": 101})
     @patch("gdoc.api.docs.insert_markdown_into_tab",
            return_value={"tab_id": "t.x", "tab_title": "X", "insert_index": 1})
@@ -249,3 +277,6 @@ class TestTabBaselineUrlParity:
             cmd_write(args)
         assert exc.value.exit_code == 3
         mock_insert.assert_not_called()
+        # With no baseline the write is rejected regardless of version, so
+        # the quiet path must not spend a get_file_version call to learn it.
+        _ver.assert_not_called()

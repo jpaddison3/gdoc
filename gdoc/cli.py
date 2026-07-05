@@ -1433,14 +1433,19 @@ def _check_tab_write_conflict(
         return change_info
 
     if not force:
-        from gdoc.api.drive import get_file_version
-
         state = load_state(doc_id)
         baseline = _max_opt(
             state.last_read_version if state else None,
             _tab_read_version(state, tab_id),
         )
-        current_version = get_file_version(doc_id).get("version")
+        # Short-circuit like _check_write_conflict's quiet branch: with no
+        # baseline the write is rejected regardless of the current version, so
+        # skip the get_file_version network call --quiet exists to avoid.
+        current_version = None
+        if baseline is not None:
+            from gdoc.api.drive import get_file_version
+
+            current_version = get_file_version(doc_id).get("version")
         _raise_on_tab_conflict(tab_label, baseline, current_version)
 
     return None

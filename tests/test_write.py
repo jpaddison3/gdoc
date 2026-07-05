@@ -72,6 +72,21 @@ def _stub_single_tab():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _isolate_state_dir(tmp_path_factory):
+    """Point per-doc state at a throwaway dir for the whole module.
+
+    The non-quiet `write --tab` conflict check now calls the real
+    `load_state(doc_id)` (for the per-tab baseline), so tests that don't
+    mock `gdoc.state` would otherwise read the developer's real
+    ~/.config/gdoc/state/<doc_id>.json and could flip on a stray file.
+    Isolating STATE_DIR keeps them hermetic; tests that patch
+    `gdoc.state.load_state` directly are unaffected.
+    """
+    with patch("gdoc.state.STATE_DIR", tmp_path_factory.mktemp("state")):
+        yield
+
+
 class TestWriteBasic:
     @patch("gdoc.state.update_state_after_command")
     @patch("gdoc.api.drive.get_drive_service")
