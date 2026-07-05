@@ -13,6 +13,25 @@ from gdoc.state import DocState
 from gdoc.util import AuthError, GdocError
 
 
+def _doc_with_tabs(*tabs):
+    """Build a get_document_with_tabs() response for the given tabs.
+
+    Each arg is an ``(id, title)`` pair. cmd_write's per-tab branch fetches
+    this doc, flattens it, and resolves the requested tab against it before
+    the conflict check — so a tab-write test must supply a matching tab here.
+    """
+    return {
+        "revisionId": "rev1",
+        "tabs": [
+            {
+                "tabProperties": {"tabId": tid, "title": title, "index": i},
+                "documentTab": {"body": {"content": []}},
+            }
+            for i, (tid, title) in enumerate(tabs)
+        ],
+    }
+
+
 def _make_args(**overrides):
     """Build a SimpleNamespace mimicking parsed write args.
 
@@ -293,18 +312,21 @@ class TestWriteInSync:
         assert mock_state.call_args.kwargs["command_version"] == 12
         assert mock_state.call_args.kwargs["command"] == "write"
 
+    @patch("gdoc.api.docs.get_document_with_tabs")
     @patch("gdoc.api.drive.export_doc", return_value="content")
     @patch("gdoc.api.docs.insert_markdown_into_tab")
     @patch("gdoc.notify.pre_flight")
     def test_write_tab_conflict_not_rescued_by_content_match(
-        self, mock_pf, mock_insert, mock_export, tmp_path,
+        self, mock_pf, mock_insert, mock_export, mock_doc, tmp_path,
     ):
-        """Tab writes never compare content — a tab body isn't the full doc."""
+        """Tab writes never compare content — a tab body isn't the full doc,
+        so a version mismatch conflicts instead of an in-sync rescue."""
         f = tmp_path / "test.md"
         f.write_text("content")
+        mock_doc.return_value = _doc_with_tabs(("t.notes", "Notes"))
         mock_pf.return_value = ChangeInfo(current_version=12, last_read_version=5)
         args = _make_args(file=str(f), tab="Notes")
-        with pytest.raises(GdocError, match="doc changed since last read"):
+        with pytest.raises(GdocError, match="may have changed since last read"):
             cmd_write(args)
         mock_export.assert_not_called()
         mock_insert.assert_not_called()
@@ -753,17 +775,20 @@ class TestWriteCollapseSafety:
 class TestWriteTabScoped:
     """--tab NAME writes only to that tab via Docs API."""
 
+    @patch("gdoc.api.docs.get_document_with_tabs")
     @patch("gdoc.state.update_state_after_command")
     @patch("gdoc.api.drive.get_file_version", return_value={"version": 11})
     @patch("gdoc.api.docs.insert_markdown_into_tab")
     @patch("gdoc.notify.pre_flight")
     def test_forced_tab_write_does_not_claim_full_read(
-        self, mock_pf, mock_insert, _ver, mock_state, tmp_path,
+        self, mock_pf, mock_insert, _ver, mock_state, mock_doc, tmp_path,
     ):
         """A forced tab write bypasses the conflict check and touches one
-        tab — it must not advance the whole-doc read baseline."""
+        tab — it must not advance the whole-doc read baseline, and it stamps
+        the tab's own baseline instead."""
         f = tmp_path / "doc.md"
         f.write_text("body")
+        mock_doc.return_value = _doc_with_tabs(("t.a", "A"))
         mock_pf.return_value = ChangeInfo(
             current_version=10, last_read_version=5,
         )
@@ -774,16 +799,19 @@ class TestWriteTabScoped:
         rc = cmd_write(args)
         assert rc == 0
         assert mock_state.call_args.kwargs["full_doc_write"] is False
+        assert mock_state.call_args.kwargs["written_tab_id"] == "t.a"
 
+    @patch("gdoc.api.docs.get_document_with_tabs")
     @patch("gdoc.state.update_state_after_command")
     @patch("gdoc.api.drive.get_file_version", return_value={"version": 11})
     @patch("gdoc.api.docs.insert_markdown_into_tab")
     @patch("gdoc.notify.pre_flight")
     def test_tab_scoped_uses_docs_api(
-        self, mock_pf, mock_insert, _ver, _update, tmp_path,
+        self, mock_pf, mock_insert, _ver, _update, mock_doc, tmp_path,
     ):
         f = tmp_path / "doc.md"
         f.write_text("# New body\n")
+        mock_doc.return_value = _doc_with_tabs(("t.todo", "TODO for Mark"))
         mock_pf.return_value = ChangeInfo(
             current_version=10, last_read_version=10,
         )
@@ -795,10 +823,13 @@ class TestWriteTabScoped:
         args = _make_args(file=str(f), tab="TODO for Mark")
         rc = cmd_write(args)
         assert rc == 0
+        # The pre-fetched doc is threaded through so it isn't fetched twice.
         mock_insert.assert_called_once_with(
             "abc123", "TODO for Mark", "# New body\n", replace=True,
+            doc=mock_doc.return_value,
         )
 
+    @patch("gdoc.api.docs.get_document_with_tabs")
     @patch("gdoc.state.update_state_after_command")
     @patch("gdoc.api.drive.get_file_version", return_value={"version": 11})
     @patch("gdoc.api.drive.update_doc_content")
@@ -807,10 +838,11 @@ class TestWriteTabScoped:
     @patch("gdoc.notify.pre_flight")
     def test_tab_scoped_does_not_touch_drive(
         self, mock_pf, mock_insert, mock_tabs, mock_update_doc, _ver,
-        _update, tmp_path,
+        _update, mock_doc, tmp_path,
     ):
         f = tmp_path / "doc.md"
         f.write_text("body")
+        mock_doc.return_value = _doc_with_tabs(("t.todo", "TODO"))
         mock_pf.return_value = ChangeInfo(
             current_version=10, last_read_version=10,
         )
@@ -824,17 +856,19 @@ class TestWriteTabScoped:
         # --tab writes must not invoke it.
         mock_tabs.assert_not_called()
 
+    @patch("gdoc.api.docs.get_document_with_tabs")
     @patch("gdoc.state.update_state_after_command")
     @patch("gdoc.api.drive.get_file_version", return_value={"version": 11})
     @patch("gdoc.api.docs.insert_markdown_into_tab")
     @patch("gdoc.notify.pre_flight")
     def test_tab_scoped_strips_frontmatter(
-        self, mock_pf, mock_insert, _ver, _update, tmp_path,
+        self, mock_pf, mock_insert, _ver, _update, mock_doc, tmp_path,
     ):
         f = tmp_path / "doc.md"
         f.write_text(
             "---\ngdoc: abc123\n---\n# Real body\n",
         )
+        mock_doc.return_value = _doc_with_tabs(("t.a", "A"))
         mock_pf.return_value = ChangeInfo(
             current_version=10, last_read_version=10,
         )
@@ -851,16 +885,19 @@ class TestWriteTabScoped:
 class TestWriteUrlTab:
     """A ?tab= in the document URL drives the per-tab write path."""
 
+    @patch("gdoc.api.docs.get_document_with_tabs")
     @patch("gdoc.state.update_state_after_command")
     @patch("gdoc.api.drive.get_file_version", return_value={"version": 11})
     @patch("gdoc.api.drive.update_doc_content")
     @patch("gdoc.api.docs.insert_markdown_into_tab")
     @patch("gdoc.notify.pre_flight")
     def test_url_tab_writes_single_tab(
-        self, mock_pf, mock_insert, mock_update_doc, _ver, mock_state, tmp_path,
+        self, mock_pf, mock_insert, mock_update_doc, _ver, mock_state,
+        mock_doc, tmp_path,
     ):
         f = tmp_path / "doc.md"
         f.write_text("# New body\n")
+        mock_doc.return_value = _doc_with_tabs(("t.second", "Second"))
         mock_pf.return_value = ChangeInfo(
             current_version=10, last_read_version=10,
         )
@@ -875,9 +912,11 @@ class TestWriteUrlTab:
         assert rc == 0
         mock_insert.assert_called_once_with(
             "abc123", "t.second", "# New body\n", replace=True,
+            doc=mock_doc.return_value,
         )
         mock_update_doc.assert_not_called()
         assert mock_state.call_args.kwargs["full_doc_write"] is False
+        assert mock_state.call_args.kwargs["written_tab_id"] == "t.second"
 
     def test_url_tab_and_force_collapse_conflict(self, tmp_path):
         args = _make_args(

@@ -396,9 +396,11 @@ def cmd_cat(args) -> int:
         from gdoc.api.docs import get_document_tabs, get_tab_text, resolve_tab
 
         tabs = get_document_tabs(doc_id)
+        read_tab_id = None
 
         if tab:
             match = resolve_tab(tabs, tab)
+            read_tab_id = match["id"]
             content = get_tab_text(match)
             if no_images:
                 from gdoc.mdimport import strip_images
@@ -430,8 +432,13 @@ def cmd_cat(args) -> int:
             else:
                 print(content, end="")
 
+        # A single-tab read stamps only that tab's baseline; --all-tabs is a
+        # whole-doc read (read_tab_id stays None) and advances the global one.
         from gdoc.state import update_state_after_command
-        update_state_after_command(doc_id, change_info, command="cat", quiet=quiet)
+        update_state_after_command(
+            doc_id, change_info, command="cat", quiet=quiet,
+            read_tab_id=read_tab_id,
+        )
         return 0
 
     if getattr(args, "comments", False):
@@ -1359,6 +1366,86 @@ def _check_write_conflict(
     return None, False
 
 
+def _max_opt(a, b):
+    """max of two Optional[int]s, treating None as absent."""
+    vals = [v for v in (a, b) if v is not None]
+    return max(vals) if vals else None
+
+
+def _tab_read_version(state, tab_id: str):
+    """This tab's stamped read baseline from state, or None."""
+    return state.tab_read_versions.get(tab_id) if state else None
+
+
+def _raise_on_tab_conflict(tab_label: str, baseline, current_version) -> None:
+    """Raise GdocError(exit_code=3) if a tab write can't be safely made."""
+    if baseline is None:
+        raise GdocError(
+            f"no read baseline for tab {tab_label!r}. "
+            f"Run 'gdoc cat --tab {tab_label}' (or 'gdoc cat DOC' for the "
+            "whole doc) first, or use --force to overwrite.",
+            exit_code=3,
+        )
+    if current_version is not None and current_version != baseline:
+        # "may" is honest: Drive versions are doc-global, so a sibling tab's
+        # edit also trips this. Conservative, and no worse than pre-per-tab.
+        raise GdocError(
+            f"tab {tab_label!r} may have changed since last read "
+            f"(doc moved v{baseline} -> v{current_version}). "
+            f"Run 'gdoc cat --tab {tab_label}' first, or use --force to "
+            "overwrite.",
+            exit_code=3,
+        )
+
+
+def _check_tab_write_conflict(
+    doc_id: str, tab_id: str, tab_label: str, quiet: bool, force: bool,
+):
+    """Conflict detection for a tab-scoped write (per-tab baseline).
+
+    Mirrors _check_write_conflict but checks the effective *tab* baseline —
+    lenient rule: max(whole-doc last_read_version, this tab's read version).
+    A plain `cat`/`pull` exports the whole doc (every tab), so the global
+    baseline legitimately covers tab X; a `cat --tab X` or an earlier
+    `write --tab X` stamps X's own entry. Non-quiet reads the global part
+    from pre-flight and the per-tab part from state, exactly as
+    _check_write_conflict does. Tab writes never get the content-match
+    rescue — a tab body is never the whole-doc export — so no in_sync return.
+
+    Returns change_info (from pre_flight, or None under --quiet).
+    Raises GdocError(exit_code=3) on a real conflict.
+    """
+    from gdoc.state import load_state
+
+    if not quiet:
+        from gdoc.notify import pre_flight
+
+        change_info = pre_flight(doc_id, quiet=False)
+        _require_doc(doc_id, change_info)
+        if not force:
+            baseline = _max_opt(
+                change_info.last_read_version,
+                _tab_read_version(load_state(doc_id), tab_id),
+            )
+            _raise_on_tab_conflict(
+                tab_label, baseline, change_info.current_version,
+            )
+        return change_info
+
+    if not force:
+        from gdoc.api.drive import get_file_version
+
+        state = load_state(doc_id)
+        baseline = _max_opt(
+            state.last_read_version if state else None,
+            _tab_read_version(state, tab_id),
+        )
+        current_version = get_file_version(doc_id).get("version")
+        _raise_on_tab_conflict(tab_label, baseline, current_version)
+
+    return None
+
+
 def cmd_write(args) -> int:
     """Handler for `gdoc write`."""
     import os
@@ -1393,62 +1480,81 @@ def cmd_write(args) -> int:
     from gdoc.frontmatter import parse_frontmatter
     _, content = parse_frontmatter(content)
 
-    # Conflict detection. Content comparison only applies to full-doc
-    # writes — a tab write's body never equals the whole-doc export.
+    from gdoc.format import format_json, get_output_mode
+    from gdoc.state import update_state_after_command
+    mode = get_output_mode(args)
+
+    if tab_name:
+        # Per-tab write. Resolve the tab first — the conflict check needs its
+        # id for the per-tab baseline — then hand the fetched doc to the write
+        # so the whole document isn't fetched twice.
+        from gdoc.api.docs import (
+            flatten_tabs,
+            get_document_with_tabs,
+            insert_markdown_into_tab,
+            resolve_tab,
+        )
+        from gdoc.api.drive import get_file_version
+
+        doc = get_document_with_tabs(doc_id)
+        tab_match = resolve_tab(flatten_tabs(doc.get("tabs", [])), tab_name)
+        tab_id = tab_match["id"]
+
+        change_info = _check_tab_write_conflict(
+            doc_id, tab_id, tab_name, quiet, force,
+        )
+
+        result = insert_markdown_into_tab(
+            doc_id, tab_name, content, replace=True, doc=doc,
+        )
+        command_version = get_file_version(doc_id).get("version")
+        _print_tab_write_result(
+            mode, doc_id, result, command_version, verb="wrote",
+        )
+
+        update_state_after_command(
+            doc_id, change_info, command="write",
+            quiet=quiet, command_version=command_version,
+            full_doc_write=False, written_tab_id=tab_id,
+        )
+        return 0
+
+    # Whole-doc write. Content comparison rescues an in-sync write (our own
+    # earlier write, or a cosmetic version bump) from a false conflict.
     change_info, in_sync = _check_write_conflict(
-        doc_id, quiet, force, body=None if tab_name else content,
+        doc_id, quiet, force, body=content,
     )
     if in_sync:
         return _finish_noop_write(doc_id, change_info, args, quiet, command="write")
 
-    from gdoc.format import format_json, get_output_mode
-    mode = get_output_mode(args)
+    # Refuse destructive multi-tab collapse unless the user opts in.
+    if not force_collapse:
+        from gdoc.api.docs import count_document_tabs
+        tab_count = count_document_tabs(doc_id)
+        if tab_count > 1:
+            raise GdocError(
+                f"write would collapse {tab_count} tabs into 1. "
+                "Use `gdoc write --tab NAME FILE` for per-tab "
+                "writes, `gdoc insert --tab NAME FILE` to populate "
+                "a tab, or pass --force-collapse-tabs to confirm.",
+                exit_code=3,
+            )
 
-    if tab_name:
-        from gdoc.api.docs import insert_markdown_into_tab
-        result = insert_markdown_into_tab(
-            doc_id, tab_name, content, replace=True,
-        )
+    from gdoc.api.drive import update_doc_content
+    command_version = update_doc_content(doc_id, content)
 
-        from gdoc.api.drive import get_file_version
-        version_data = get_file_version(doc_id)
-        command_version = version_data.get("version")
-
-        _print_tab_write_result(
-            mode, doc_id, result, command_version, verb="wrote",
-        )
+    if mode == "json":
+        print(format_json(written=True, version=command_version))
+    elif mode == "plain":
+        print(f"id\t{doc_id}")
+        print("status\tupdated")
     else:
-        # Refuse destructive multi-tab collapse unless the user opts in.
-        if not force_collapse:
-            from gdoc.api.docs import count_document_tabs
-            tab_count = count_document_tabs(doc_id)
-            if tab_count > 1:
-                raise GdocError(
-                    f"write would collapse {tab_count} tabs into 1. "
-                    "Use `gdoc write --tab NAME FILE` for per-tab "
-                    "writes, `gdoc insert --tab NAME FILE` to populate "
-                    "a tab, or pass --force-collapse-tabs to confirm.",
-                    exit_code=3,
-                )
-
-        from gdoc.api.drive import update_doc_content
-        command_version = update_doc_content(doc_id, content)
-
-        if mode == "json":
-            print(format_json(written=True, version=command_version))
-        elif mode == "plain":
-            print(f"id\t{doc_id}")
-            print("status\tupdated")
-        else:
-            print("OK written")
-
-    # Update state
-    from gdoc.state import update_state_after_command
+        print("OK written")
 
     update_state_after_command(
         doc_id, change_info, command="write",
         quiet=quiet, command_version=command_version,
-        full_doc_write=not tab_name,
+        full_doc_write=True,
     )
 
     return 0

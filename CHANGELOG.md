@@ -4,6 +4,33 @@ All notable changes to `gdoc` are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] — 2026-07-05
+
+### Fixed
+- **Per-tab write-conflict baselines.** The write guard now tracks a read
+  baseline *per tab*, not just per document — a follow-up to the `?tab=` URL
+  support in 0.13.0. Two defects on multi-tab docs are fixed:
+  - **Cross-tab false negative.** `write --tab B` after only `cat --tab A`
+    used to be satisfied by A's read and would replace tab B unseen. It now
+    errors `no read baseline for tab 'B'` until you read B (or the whole doc).
+  - **Same-tab false positive.** `write --tab X` twice in a row used to
+    conflict on the second write (the first write bumped the doc version but
+    the tab-scoped write left the baseline behind). A tab write now advances
+    that tab's own baseline, so repeated edits to one tab just work.
+
+  A plain `cat`/`pull` still covers every tab (its Drive export is the whole
+  document), so the common read-then-write flow is unchanged. An edit to a
+  *different* tab still trips the check — Google's version number is
+  per-document — which is conservative by design; `--force` overrides.
+
+### Changed
+- State files gain a `tab_read_versions` map. Older state files load unchanged
+  (empty map); no migration needed.
+
+### Docs
+- Corrected the README Tabs section: the Drive export returns **all** tabs
+  (each under a `# **Tab title**` heading), not just the first.
+
 ## [0.13.0] — 2026-07-04
 
 ### Added

@@ -323,8 +323,10 @@ class TestCatTabAwareness:
         rc = cmd_cat(args)
         assert rc == 0
         mock_pf.assert_called_once_with("abc123", quiet=False)
+        # A tab read stamps that tab's baseline, not the whole-doc one.
         mock_update.assert_called_once_with(
             "abc123", change_info, command="cat", quiet=False,
+            read_tab_id="t1",
         )
 
     @patch("gdoc.state.update_state_after_command")
@@ -343,3 +345,30 @@ class TestCatTabAwareness:
         assert rc == 0
         mock_pf.assert_called_once()
         mock_update.assert_called_once()
+        # --all-tabs is a whole-doc read: no per-tab stamp.
+        assert mock_update.call_args.kwargs.get("read_tab_id") is None
+
+
+class TestCatTabBaselinePersistence:
+    """R2 regression lock, against real (tmp) state: a single-tab read stamps
+    only that tab's baseline and never advances the whole-doc one."""
+
+    def test_tab_read_does_not_advance_global_baseline(self, tmp_path):
+        from gdoc.state import DocState, load_state, save_state
+
+        with patch("gdoc.state.STATE_DIR", tmp_path):
+            save_state("abc123", DocState(last_read_version=50, last_version=50))
+            change_info = ChangeInfo(
+                current_version=100,
+                mime_type="application/vnd.google-apps.document",
+            )
+            with patch("gdoc.notify.pre_flight", return_value=change_info), \
+                 patch("gdoc.api.docs.get_document_tabs",
+                       return_value=[_tab("t.notes", "Notes", "body\n")]), \
+                 patch("gdoc.api.docs.get_tab_text", return_value="body\n"), \
+                 patch("gdoc.api.docs.get_docs_service"):
+                rc = cmd_cat(_make_args(tab="Notes"))
+            assert rc == 0
+            state = load_state("abc123")
+            assert state.last_read_version == 50  # global untouched
+            assert state.tab_read_versions == {"t.notes": 100}

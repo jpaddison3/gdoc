@@ -275,6 +275,8 @@ gdoc write DOC draft.md    # OK written
 
 Use `--force` to skip conflict detection. Use `--quiet` to skip pre-flight checks entirely (saves 2 API calls).
 
+**Tabs get their own baseline.** For a tab-scoped write (`write --tab X`, or a pasted `?tab=` URL), the baseline is tracked per tab: `gdoc cat --tab X` establishes a baseline for tab X alone, while a whole-document `gdoc cat DOC` covers every tab (the Drive export is the full document). So reading tab A does **not** let you overwrite tab B unseen — `write --tab B` then errors `no read baseline for tab 'B'` — and writing the same tab twice in a row won't false-conflict against your own edit. Because Google's version number is per-document, an edit to *another* tab still trips the check for tab X (conservative by design); `--force` overrides.
+
 ## Spreadsheets
 
 `cat`, `tabs`, and `info` detect Google Sheets automatically — point them at a
@@ -357,7 +359,7 @@ HTML output has no extra dependencies. Richer artifacts (docx, PDF, …) are del
 
 ## Tabs
 
-Google Docs supports multiple tabs per document. The default `cat` command uses Drive export which only returns the first tab. Use `--tab` or `--all-tabs` to read tab content via the Docs API:
+Google Docs supports multiple tabs per document. The default `cat` (Drive export) returns the **whole document** — every tab, each introduced by a `# **Tab title**` heading — as one markdown stream. Use `--tab` to isolate a single tab or `--all-tabs` for every tab with `=== Tab: … ===` separators, read via the Docs API:
 
 ```bash
 # List tabs in a document

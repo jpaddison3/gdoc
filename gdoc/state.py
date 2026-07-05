@@ -18,6 +18,10 @@ class DocState:
     last_comment_check: str = ""                 # ISO timestamp for comments.list
     known_comment_ids: list[str] = field(default_factory=list)
     known_resolved_ids: list[str] = field(default_factory=list)
+    # Resolved tab id -> doc version at the last full read/write of that tab.
+    # The write-conflict baseline for a tab-scoped write is per-tab (see
+    # update_state_after_command). Old state files load with an empty dict.
+    tab_read_versions: dict[str, int] = field(default_factory=dict)
 
 
 def _state_path(doc_id: str) -> Path:
@@ -63,6 +67,8 @@ def update_state_after_command(
     command_version: int | None = None,
     comment_state_patch: dict | None = None,
     full_doc_write: bool = False,
+    read_tab_id: str | None = None,
+    written_tab_id: str | None = None,
 ) -> None:
     """Update per-doc state after a successful command.
 
@@ -76,6 +82,12 @@ def update_state_after_command(
             Keys: "add_comment_id", "add_resolved_id", "remove_resolved_id".
         full_doc_write: True when the command replaced the entire document
             content, so the write doubles as a read of the whole doc.
+        read_tab_id: Set for a tab-scoped read (`cat --tab X`). Stamps that
+            tab's read baseline in tab_read_versions instead of advancing the
+            whole-doc last_read_version — a single-tab read is not a full read.
+        written_tab_id: Set for a tab-scoped write (`write --tab X`). Stamps
+            that tab's baseline to the post-write version so the writer's own
+            output doesn't false-conflict a later write to the same tab.
     """
     from datetime import datetime, timezone
 
@@ -83,7 +95,9 @@ def update_state_after_command(
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     state.last_seen = now
 
-    is_read = command in ("cat", "info", "pull")
+    # A tab-scoped read is NOT a whole-doc read: it stamps only that tab's
+    # baseline, never the doc-global last_read_version.
+    is_read = command in ("cat", "info", "pull") and read_tab_id is None
 
     if quiet:
         # Decision #14: --quiet state update rules
@@ -96,6 +110,8 @@ def update_state_after_command(
             state.last_version = change_info.current_version
             if is_read:
                 state.last_read_version = change_info.current_version
+            if read_tab_id is not None:
+                state.tab_read_versions[read_tab_id] = change_info.current_version
 
         # Advance last_comment_check to pre-request timestamp (Decision #12)
         if change_info.preflight_timestamp:
@@ -118,6 +134,11 @@ def update_state_after_command(
         # the rest of the doc may hold changes the writer never saw.
         if full_doc_write:
             state.last_read_version = command_version
+        # A tab-scoped write is a full read+replace of that one tab: stamp its
+        # per-tab baseline so a second write to the same tab doesn't conflict
+        # against the version our own write just produced.
+        if written_tab_id is not None:
+            state.tab_read_versions[written_tab_id] = command_version
 
     # Apply comment mutation patch (both quiet and non-quiet)
     # Per CONTEXT.md Decision #10
