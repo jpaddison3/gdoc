@@ -60,12 +60,17 @@ def _write_args(doc, tab, file, **over):
 
 
 def _run_cat_tab(doc, tab_title, tab_id, version):
-    """Run `gdoc cat --tab TITLE` non-quiet; persists state under the caller's
-    STATE_DIR patch. Stamps tab_read_versions[tab_id] = version."""
+    """Run `gdoc cat --tab TITLE` non-quiet against a MULTI-tab doc; persists
+    state under the caller's STATE_DIR patch. Stamps tab_read_versions[tab_id]
+    = version. The mock carries a sibling tab on purpose: on a single-tab doc a
+    `--tab` read would instead advance the whole-doc baseline."""
     change_info = ChangeInfo(current_version=version, mime_type=DOC_MIME)
     with patch("gdoc.notify.pre_flight", return_value=change_info), \
          patch("gdoc.api.docs.get_document_tabs",
-               return_value=[_tab_dict(tab_id, tab_title)]), \
+               return_value=[
+                   _tab_dict(tab_id, tab_title),
+                   _tab_dict("t.sibling", "Sibling"),
+               ]), \
          patch("gdoc.api.docs.get_tab_text", return_value="body\n"), \
          patch("gdoc.api.docs.get_docs_service"):
         assert cmd_cat(_cat_args(doc, tab_title)) == 0
@@ -146,6 +151,33 @@ class TestTabBaselineWorkflow:
                  patch("gdoc.api.drive.get_file_version",
                        return_value={"version": 100}):
                 assert cmd_write(_write_args("abc123", "B", str(f))) == 0
+
+    def test_single_tab_cat_then_whole_doc_write_succeeds(self, tmp_path):
+        """R1 fix: on a single-tab doc, `cat --tab X` reads the whole document,
+        so it advances the whole-doc baseline and a following whole-document
+        `write DOC` is not blocked. (When tab reads stopped advancing the
+        global baseline, this briefly errored 'no read baseline'.)"""
+        f = tmp_path / "body.md"
+        f.write_text("# edited\n")
+        with patch("gdoc.state.STATE_DIR", tmp_path):
+            # Single-tab cat --tab is a whole-doc read: advances last_read.
+            change_info = ChangeInfo(current_version=100, mime_type=DOC_MIME)
+            with patch("gdoc.notify.pre_flight", return_value=change_info), \
+                 patch("gdoc.api.docs.get_document_tabs",
+                       return_value=[_tab_dict("t.only", "Only")]), \
+                 patch("gdoc.api.docs.get_tab_text", return_value="body\n"), \
+                 patch("gdoc.api.docs.get_docs_service"):
+                assert cmd_cat(_cat_args("abc123", "Only")) == 0
+            st = load_state("abc123")
+            assert st.last_read_version == 100
+            assert st.tab_read_versions == {}  # not a per-tab stamp
+
+            # Whole-doc write at the same version passes on that baseline.
+            with patch("gdoc.api.drive.get_file_version",
+                       return_value={"version": 100}), \
+                 patch("gdoc.api.docs.count_document_tabs", return_value=1), \
+                 patch("gdoc.api.drive.update_doc_content", return_value=101):
+                assert cmd_write(_write_args("abc123", None, str(f))) == 0
 
 
 class TestTabBaselineDecision:

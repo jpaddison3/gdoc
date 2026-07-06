@@ -19,9 +19,11 @@ All notable changes to `gdoc` are documented here. This project follows
     that tab's own baseline, so repeated edits to one tab just work.
 
   A plain `cat`/`pull` still covers every tab (its Drive export is the whole
-  document), so the common read-then-write flow is unchanged. An edit to a
-  *different* tab still trips the check — Google's version number is
-  per-document — which is conservative by design; `--force` overrides.
+  document), so the common read-then-write flow is unchanged. On a single-tab
+  document a `cat --tab X` reads the whole document too, so a following
+  whole-document `write`/`push` is not blocked. An edit to a *different* tab
+  still trips the check — Google's version number is per-document — which is
+  conservative by design; `--force` overrides.
 
 ### Changed
 - State files gain a `tab_read_versions` map. Older state files load unchanged

@@ -318,7 +318,8 @@ class TestCatTabAwareness:
     ):
         change_info = ChangeInfo(current_version=7)
         mock_pf.return_value = change_info
-        mock_tabs.return_value = [_tab("t1", "Tab 1")]
+        # Multi-tab doc: a --tab read covers only that tab.
+        mock_tabs.return_value = [_tab("t1", "Tab 1"), _tab("t2", "Tab 2")]
         args = _make_args(tab="Tab 1")
         rc = cmd_cat(args)
         assert rc == 0
@@ -328,6 +329,25 @@ class TestCatTabAwareness:
             "abc123", change_info, command="cat", quiet=False,
             read_tab_id="t1",
         )
+
+    @patch("gdoc.state.update_state_after_command")
+    @patch("gdoc.notify.pre_flight")
+    @patch("gdoc.api.docs.get_tab_text", return_value="text\n")
+    @patch("gdoc.api.docs.get_document_tabs")
+    @patch("gdoc.api.docs.get_docs_service")
+    def test_single_tab_read_advances_global_baseline(
+        self, _svc, mock_tabs, _text, mock_pf, mock_update,
+    ):
+        """On a single-tab doc, `cat --tab X` reads the whole document, so it
+        advances the whole-doc baseline (read_tab_id None) rather than stamping
+        a per-tab one — otherwise a following whole-doc write/push would be
+        spuriously blocked."""
+        change_info = ChangeInfo(current_version=7)
+        mock_pf.return_value = change_info
+        mock_tabs.return_value = [_tab("t.only", "Only")]
+        rc = cmd_cat(_make_args(tab="Only"))
+        assert rc == 0
+        assert mock_update.call_args.kwargs.get("read_tab_id") is None
 
     @patch("gdoc.state.update_state_after_command")
     @patch("gdoc.notify.pre_flight")
@@ -350,8 +370,9 @@ class TestCatTabAwareness:
 
 
 class TestCatTabBaselinePersistence:
-    """R2 regression lock, against real (tmp) state: a single-tab read stamps
-    only that tab's baseline and never advances the whole-doc one."""
+    """R2 regression lock, against real (tmp) state: on a multi-tab doc a
+    single-tab read stamps only that tab's baseline and never advances the
+    whole-doc one (which would let a sibling tab be overwritten unseen)."""
 
     def test_tab_read_does_not_advance_global_baseline(self, tmp_path):
         from gdoc.state import DocState, load_state, save_state
@@ -364,7 +385,10 @@ class TestCatTabBaselinePersistence:
             )
             with patch("gdoc.notify.pre_flight", return_value=change_info), \
                  patch("gdoc.api.docs.get_document_tabs",
-                       return_value=[_tab("t.notes", "Notes", "body\n")]), \
+                       return_value=[
+                           _tab("t.notes", "Notes", "body\n"),
+                           _tab("t.other", "Other", "other\n"),
+                       ]), \
                  patch("gdoc.api.docs.get_tab_text", return_value="body\n"), \
                  patch("gdoc.api.docs.get_docs_service"):
                 rc = cmd_cat(_make_args(tab="Notes"))

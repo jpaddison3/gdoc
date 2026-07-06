@@ -400,7 +400,13 @@ def cmd_cat(args) -> int:
 
         if tab:
             match = resolve_tab(tabs, tab)
-            read_tab_id = match["id"]
+            # On a multi-tab doc a `--tab` read covers only that tab, so it
+            # stamps just that tab's baseline. On a single-tab doc the one tab
+            # IS the whole document, so the read advances the whole-doc
+            # baseline (read_tab_id stays None) — otherwise a following
+            # whole-doc write/push would be spuriously blocked for no baseline.
+            if len(tabs) > 1:
+                read_tab_id = match["id"]
             content = get_tab_text(match)
             if no_images:
                 from gdoc.mdimport import strip_images
