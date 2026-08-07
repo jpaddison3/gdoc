@@ -9,10 +9,10 @@ All notable changes to `gdoc` are documented here. This project follows
 ### Added
 - **Document URLs honor their `?tab=` deep link.** Google's editor appends
   `?tab=<id>` when you open a tab, so a pasted tab URL now acts exactly like
-  `--tab <id>` for `cat`, `edit` (incl. `--cell`), `write`, `insert`, and
-  `toc` — previously the tab was silently dropped and the command operated on
-  the first tab (or whole doc). An explicit `--tab`/`--all-tabs` still
-  overrides the URL.
+  `--tab <id>` for `cat`, `edit` (incl. `--cell`), `write`, `insert`, `toc`,
+  `structure`, and `insert-image` — previously the tab was silently dropped
+  and the command operated on the first tab (or whole doc). An explicit
+  `--tab`/`--all-tabs` still overrides the URL.
 
 ### Fixed
 - **Per-tab write-conflict baselines.** The write guard now tracks a read
@@ -31,7 +31,9 @@ All notable changes to `gdoc` are documented here. This project follows
   document a `cat --tab X` reads the whole document too, so a following
   whole-document `write`/`push` is not blocked. An edit to a *different* tab
   still trips the check — Google's version number is per-document — which is
-  conservative by design; `--force` overrides.
+  conservative by design; `--force` overrides. `structure --tab X` follows
+  the same rule as `cat --tab X`: on a multi-tab doc it stamps only that
+  tab's baseline, not the whole-doc one.
 
 ### Changed
 - State files gain a `tab_read_versions` map. Older state files load unchanged
@@ -48,9 +50,9 @@ All notable changes to `gdoc` are documented here. This project follows
 - Combining a URL tab with a whole-document flag errors (exit 3) and names the
   URL as the source: `cat --comments`/`--revision`,
   `write --force-collapse-tabs`.
-- `pull`/`push` ignore a URL tab (they round-trip the whole document) but print
-  a one-line stderr `NOTE:` when discarding a non-`t.0` tab (suppressed under
-  `--quiet`).
+- `pull`/`push`/`export` ignore a URL tab (they cover the whole document) but
+  print a one-line stderr `NOTE:` when discarding a non-`t.0` tab (suppressed
+  under `--quiet`).
 - Spreadsheet `#gid=` deep links are still unparsed — select a worksheet with
   `--tab`/`--range`.
 

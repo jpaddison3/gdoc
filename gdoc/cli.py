@@ -2663,8 +2663,10 @@ _EXT_TO_FORMAT = {
 
 def cmd_export(args) -> int:
     """Handler for `gdoc export`: render a doc to PDF/DOCX/HTML/etc."""
-    doc_id = _resolve_doc_id(args.doc)
+    doc_id, url_tab = _resolve_doc_ref(args.doc)
     quiet = getattr(args, "quiet", False)
+    # Exports always render the whole document, all tabs included.
+    _note_discarded_url_tab(url_tab, "export", quiet)
     fmt = getattr(args, "format", None)
     out = getattr(args, "out", None)
 
@@ -2880,7 +2882,7 @@ def cmd_insert_image(args) -> int:
     """Handler for `gdoc insert-image`: add an image to an existing doc."""
     import math
 
-    doc_id = _resolve_doc_id(args.doc)
+    doc_id, url_tab = _resolve_doc_ref(args.doc)
     quiet = getattr(args, "quiet", False)
     for name in ("width", "height"):
         val = getattr(args, name, None)
@@ -2902,7 +2904,8 @@ def cmd_insert_image(args) -> int:
 
     doc = get_document_with_tabs(doc_id)
     revision_id = doc.get("revisionId", "")
-    tab = _resolve_image_target_tab(doc, getattr(args, "tab", None))
+    tab_name, _ = _effective_tab(url_tab, getattr(args, "tab", None))
+    tab = _resolve_image_target_tab(doc, tab_name)
     tab_id = tab["id"] if tab else None
     body = tab["body"] if tab else doc.get("body", {})
 
@@ -3024,9 +3027,9 @@ def cmd_structure(args) -> int:
     """Handler for `gdoc structure`: raw document JSON for native edits."""
     import json
 
-    doc_id = _resolve_doc_id(args.doc)
+    doc_id, url_tab = _resolve_doc_ref(args.doc)
     quiet = getattr(args, "quiet", False)
-    tab_name = getattr(args, "tab", None)
+    tab_name, _ = _effective_tab(url_tab, getattr(args, "tab", None))
     fields = getattr(args, "fields", None)
     svm = getattr(args, "suggestions_view_mode", None)
     svm = svm.upper() if svm else None
@@ -3046,8 +3049,9 @@ def cmd_structure(args) -> int:
     if svm and "suggestionsViewMode" not in doc:
         doc = {**doc, "suggestionsViewMode": svm}
 
+    read_tab_id = None
     if tab_name:
-        from gdoc.api.docs import resolve_raw_tab
+        from gdoc.api.docs import flatten_tabs, resolve_raw_tab
 
         tab = resolve_raw_tab(doc.get("tabs", []), tab_name)
         if tab is None:
@@ -3056,6 +3060,11 @@ def cmd_structure(args) -> int:
                 "(with --fields, the mask must keep tabProperties)",
                 exit_code=3,
             )
+        # Same rule as `cat --tab`: on a multi-tab doc a tab-scoped read
+        # stamps only that tab's baseline; on a single-tab doc the one tab
+        # IS the whole document, so the read stays a full one.
+        if len(flatten_tabs(doc.get("tabs", []))) > 1:
+            read_tab_id = tab.get("tabProperties", {}).get("tabId") or None
         out = {
             "documentId": doc.get("documentId", doc_id),
             "title": doc.get("title", ""),
@@ -3081,6 +3090,7 @@ def cmd_structure(args) -> int:
 
     update_state_after_command(
         doc_id, change_info, command="structure", quiet=quiet,
+        read_tab_id=read_tab_id,
     )
     return 0
 
