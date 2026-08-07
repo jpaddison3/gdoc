@@ -449,3 +449,83 @@ class TestInfoDoesNotAuthorizeTabWrites:
                 with pytest.raises(GdocError, match="no read baseline"):
                     cmd_write(_write_args("abc123", "X", str(f)))
                 mi.assert_not_called()
+
+
+    def test_info_after_edit_voids_stale_provenance(self, tmp_path):
+        """cat (marker True) -> unseen edit -> info: the marker must be
+        voided — the versions between the cat and the info were never
+        read, so leaving it True would launder the edit into the guard."""
+        from gdoc.state import update_state_after_command
+
+        with patch("gdoc.state.STATE_DIR", tmp_path):
+            update_state_after_command(
+                "abc123", ChangeInfo(current_version=5), command="cat",
+                quiet=False,
+            )
+            assert load_state("abc123").global_read_covers_doc is True
+
+            update_state_after_command(
+                "abc123", ChangeInfo(current_version=6), command="info",
+                quiet=False,
+            )
+            st = load_state("abc123")
+            assert st.last_read_version == 6
+            assert st.global_read_covers_doc is False
+
+    def test_info_at_same_version_preserves_provenance(self, tmp_path):
+        """An info that confirms nothing moved keeps the cat's provenance:
+        the authorization still traces to a genuine content read."""
+        from gdoc.state import update_state_after_command
+
+        with patch("gdoc.state.STATE_DIR", tmp_path):
+            update_state_after_command(
+                "abc123", ChangeInfo(current_version=5), command="cat",
+                quiet=False,
+            )
+            update_state_after_command(
+                "abc123", ChangeInfo(current_version=5), command="info",
+                quiet=False,
+            )
+            assert load_state("abc123").global_read_covers_doc is True
+
+    def test_quiet_info_after_edit_voids_stale_provenance(self, tmp_path):
+        from gdoc.state import update_state_after_command
+
+        with patch("gdoc.state.STATE_DIR", tmp_path):
+            update_state_after_command(
+                "abc123", ChangeInfo(current_version=5), command="cat",
+                quiet=False,
+            )
+            update_state_after_command(
+                "abc123", None, command="info", quiet=True,
+                command_version=6,
+            )
+            st = load_state("abc123")
+            assert st.last_read_version == 6
+            assert st.global_read_covers_doc is False
+
+    def test_cat_edit_info_write_tab_blocked_end_to_end(self, tmp_path):
+        """The full laundering sequence must fail closed: cat v5 ->
+        collaborator edit -> info v6 -> write --tab B is blocked."""
+        from gdoc.state import update_state_after_command
+
+        f = tmp_path / "body.md"
+        f.write_text("# new\n")
+        with patch("gdoc.state.STATE_DIR", tmp_path):
+            update_state_after_command(
+                "abc123", ChangeInfo(current_version=5), command="cat",
+                quiet=False,
+            )
+            update_state_after_command(
+                "abc123", ChangeInfo(current_version=6), command="info",
+                quiet=False,
+            )
+            with patch("gdoc.api.docs.get_document_with_tabs",
+                       return_value=_doc_with_tabs(("t.a", "A"),
+                                                   ("t.b", "B"))), \
+                 patch("gdoc.api.docs.insert_markdown_into_tab") as mi, \
+                 patch("gdoc.api.drive.get_file_version",
+                       return_value={"version": 6}):
+                with pytest.raises(GdocError, match="no read baseline"):
+                    cmd_write(_write_args("abc123", "B", str(f)))
+                mi.assert_not_called()

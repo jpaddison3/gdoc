@@ -21,8 +21,10 @@ All notable changes to `gdoc` are documented here. This project follows
   - **Cross-tab false negative.** `write --tab B` after only `cat --tab A`
     used to be satisfied by A's read and would replace tab B unseen. It now
     errors `no read baseline for tab 'B'` until you read B (or the whole
-    doc; note `info` also counts as a whole-doc read despite showing only
-    metadata — a deliberate status-quo carry-over from the whole-doc guard).
+    doc). `info` still advances the whole-doc guard's baseline (status
+    quo) but never authorizes tab-scoped writes — it shows no content,
+    and an `info` that moves the baseline also voids any earlier read's
+    content provenance for the tab guard.
   - **Same-tab false positive.** `write --tab X` twice in a row used to
     conflict on the second write (the first write bumped the doc version but
     the tab-scoped write left the baseline behind). A tab write now advances

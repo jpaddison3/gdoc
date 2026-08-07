@@ -121,19 +121,29 @@ def update_state_after_command(
         # Decision #14: --quiet state update rules
         if command == "info" and command_version is not None:
             state.last_version = command_version
+            # See the non-quiet info branch below: a version bump seen
+            # only through `info` voids content provenance.
+            if command_version != state.last_read_version:
+                state.global_read_covers_doc = False
             state.last_read_version = command_version
     elif change_info is not None:
         # Normal (non-quiet) run: update from pre-flight data
         if change_info.current_version is not None:
             state.last_version = change_info.current_version
             if is_read:
-                state.last_read_version = change_info.current_version
                 # `info` shows metadata only: it keeps the whole-doc
                 # guard's status quo (advancing last_read_version) but
-                # must not claim whole-doc *content* provenance — the
-                # marker is what authorizes tab-scoped writes.
-                if command != "info":
+                # never *grants* whole-doc content provenance — and when
+                # it moves the baseline past the last genuine read, it
+                # must also VOID any existing provenance: the versions
+                # in between were never seen, so leaving the marker True
+                # would launder an unseen edit into the tab guard.
+                if command == "info":
+                    if change_info.current_version != state.last_read_version:
+                        state.global_read_covers_doc = False
+                else:
                     state.global_read_covers_doc = True
+                state.last_read_version = change_info.current_version
             if read_tab_id is not None:
                 state.tab_read_versions[read_tab_id] = change_info.current_version
 
