@@ -20,11 +20,30 @@ All notable changes to `gdoc` are documented here. This project follows
   support above. Two defects on multi-tab docs are fixed:
   - **Cross-tab false negative.** `write --tab B` after only `cat --tab A`
     used to be satisfied by A's read and would replace tab B unseen. It now
-    errors `no read baseline for tab 'B'` until you read B (or the whole doc).
+    errors `no read baseline for tab 'B'` until you read B (or the whole
+    doc; note `info` also counts as a whole-doc read despite showing only
+    metadata — a deliberate status-quo carry-over from the whole-doc guard).
   - **Same-tab false positive.** `write --tab X` twice in a row used to
     conflict on the second write (the first write bumped the doc version but
     the tab-scoped write left the baseline behind). A tab write now advances
     that tab's own baseline, so repeated edits to one tab just work.
+- **`insert --tab X` accepts a `cat --tab X` baseline.** The tab-populate
+  flow the collapse-guard error recommends no longer demands a whole-doc
+  read: `insert` runs the same per-tab conflict check as `write --tab`.
+- **`structure --fields` no longer counts as a read.** A masked response
+  may omit tab ids, sibling tabs, or the content itself, so it can't prove
+  the document (or a tab) was actually seen; it now records the
+  interaction without advancing any read baseline.
+- **Metadata-only version bumps heal per-tab baselines.** `mv`/`rename`
+  used to leave `tab_read_versions` behind their own version bump, so the
+  next `write --tab` false-conflicted. Entries current at pre-flight are
+  now carried forward under the same attributability guard as the global
+  baseline.
+- **Replacing a document's only tab counts as a whole-doc write** (the
+  single-tab rule `cat --tab` already follows), so a following
+  whole-document `write`/`push` doesn't conflict with the CLI's own edit.
+- **Blank `--tab` values are rejected** (exit 3) instead of silently
+  reading as "no tab" and mutating the default target.
 
   A plain `cat`/`pull` still covers every tab (its Drive export is the whole
   document), so the common read-then-write flow is unchanged. On a single-tab
@@ -36,8 +55,21 @@ All notable changes to `gdoc` are documented here. This project follows
   tab's baseline, not the whole-doc one.
 
 ### Changed
-- State files gain a `tab_read_versions` map. Older state files load unchanged
-  (empty map); no migration needed.
+- State files gain a `tab_read_versions` map and a
+  `global_read_covers_doc` provenance marker. Older state files load
+  unchanged, but their **whole-doc read baseline is not trusted for
+  tab-scoped writes** — a pre-0.20 `cat --tab A` stored its version in the
+  global baseline, which would wrongly authorize `write --tab B`. The
+  first `write --tab` after upgrading may therefore ask for a fresh
+  `gdoc cat`. Downgrading is safe but lossy in the same direction: a
+  pre-0.20 binary rewriting state drops both new fields, so re-upgrading
+  fail-closes (re-read before the next tab write) rather than risking an
+  overwrite.
+- **Multi-tab `cat --tab X` / `structure --tab X` no longer establish a
+  whole-doc baseline.** A scripted `cat --tab X` followed by
+  `write`/`push --force-collapse-tabs` now errors `no read baseline`
+  where it previously succeeded — reading one tab shouldn't authorize
+  flattening the others. Read the whole doc (plain `cat`) first.
 - **`?tab=t.0` is treated as no tab.** The editor auto-appends `t.0` for the
   first tab, so it's ambient UI noise; honoring it would push the common
   pasted-URL case onto the lower-fidelity Docs-API renderer. It now stays on
@@ -50,9 +82,15 @@ All notable changes to `gdoc` are documented here. This project follows
 - Combining a URL tab with a whole-document flag errors (exit 3) and names the
   URL as the source: `cat --comments`/`--revision`,
   `write --force-collapse-tabs`.
-- `pull`/`push`/`export` ignore a URL tab (they cover the whole document) but
-  print a one-line stderr `NOTE:` when discarding a non-`t.0` tab (suppressed
-  under `--quiet`).
+- `pull`/`push`/`export`/`diff`/`comments`/`images` ignore a URL tab (they
+  cover the whole document) but print a one-line stderr `NOTE:` when
+  discarding a non-`t.0` tab (suppressed under `--quiet`).
+- **`t.0` caveat:** tab ids are assigned at creation and survive
+  reordering, so after tabs are dragged around, id `t.0` may no longer be
+  the first-*positioned* tab — yet the editor still emits `?tab=t.0` when
+  viewing it, and the ambient-noise rule still drops it. If you mean that
+  tab specifically, pass `--tab t.0` explicitly (the multi-tab collapse
+  error now points this out).
 - Spreadsheet `#gid=` deep links are still unparsed — select a worksheet with
   `--tab`/`--range`.
 

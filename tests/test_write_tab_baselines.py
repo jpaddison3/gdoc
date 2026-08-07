@@ -15,7 +15,7 @@ import pytest
 
 from gdoc.cli import cmd_cat, cmd_write
 from gdoc.notify import ChangeInfo
-from gdoc.state import DocState, load_state
+from gdoc.state import DocState, load_state, save_state
 from gdoc.util import GdocError
 
 DOC_MIME = "application/vnd.google-apps.document"
@@ -102,7 +102,8 @@ class TestTabBaselineWorkflow:
                 return {"tab_id": "t.x", "tab_title": "X", "insert_index": 1}
 
             with patch("gdoc.api.docs.get_document_with_tabs",
-                       return_value=_doc_with_tabs(("t.x", "X"))), \
+                       return_value=_doc_with_tabs(("t.x", "X"),
+                                                   ("t.y", "Y"))), \
                  patch("gdoc.api.docs.insert_markdown_into_tab",
                        side_effect=fake_insert), \
                  patch("gdoc.api.drive.get_file_version", side_effect=fake_ver):
@@ -312,3 +313,101 @@ class TestTabBaselineUrlParity:
         # With no baseline the write is rejected regardless of version, so
         # the quiet path must not spend a get_file_version call to learn it.
         _ver.assert_not_called()
+
+
+class TestLegacyBaselineProvenance:
+    """F18: a pre-0.20 state file's last_read_version is ambiguous (it may
+    record a tab-scoped read) and must not authorize a tab write."""
+
+    def test_legacy_global_baseline_is_not_trusted(self, tmp_path):
+        f = tmp_path / "body.md"
+        f.write_text("# new\n")
+        with patch("gdoc.state.STATE_DIR", tmp_path):
+            # Simulates a pre-0.20 file: field filtered in as default False.
+            save_state("abc123", DocState(last_version=100,
+                                          last_read_version=100))
+            with patch("gdoc.api.docs.get_document_with_tabs",
+                       return_value=_doc_with_tabs(("t.x", "X"),
+                                                   ("t.y", "Y"))), \
+                 patch("gdoc.api.docs.insert_markdown_into_tab"), \
+                 patch("gdoc.api.drive.get_file_version",
+                       return_value={"version": 100}):
+                with pytest.raises(GdocError, match="no read baseline"):
+                    cmd_write(_write_args("abc123", "X", str(f)))
+
+    def test_marked_global_baseline_is_trusted(self, tmp_path):
+        f = tmp_path / "body.md"
+        f.write_text("# new\n")
+        with patch("gdoc.state.STATE_DIR", tmp_path):
+            save_state("abc123", DocState(
+                last_version=100, last_read_version=100,
+                global_read_covers_doc=True,
+            ))
+            with patch("gdoc.api.docs.get_document_with_tabs",
+                       return_value=_doc_with_tabs(("t.x", "X"),
+                                                   ("t.y", "Y"))), \
+                 patch("gdoc.api.docs.insert_markdown_into_tab",
+                       return_value={"tab_id": "t.x", "tab_title": "X",
+                                     "insert_index": 1}), \
+                 patch("gdoc.api.drive.get_file_version",
+                       return_value={"version": 100}):
+                assert cmd_write(_write_args("abc123", "X", str(f))) == 0
+
+    def test_whole_doc_cat_sets_provenance_marker(self, tmp_path):
+        from gdoc.state import update_state_after_command
+
+        with patch("gdoc.state.STATE_DIR", tmp_path):
+            update_state_after_command(
+                "abc123", ChangeInfo(current_version=100), command="cat",
+                quiet=False,
+            )
+            st = load_state("abc123")
+            assert st.last_read_version == 100
+            assert st.global_read_covers_doc is True
+
+    def test_tab_read_does_not_set_marker(self, tmp_path):
+        from gdoc.state import update_state_after_command
+
+        with patch("gdoc.state.STATE_DIR", tmp_path):
+            update_state_after_command(
+                "abc123", ChangeInfo(current_version=100), command="cat",
+                quiet=False, read_tab_id="t.x",
+            )
+            st = load_state("abc123")
+            assert st.last_read_version is None
+            assert st.global_read_covers_doc is False
+
+
+class TestSoleTabWholeDocRule:
+    """F21: replacing a document's only tab IS a whole-doc write."""
+
+    def test_sole_tab_write_advances_global_baseline(self, tmp_path):
+        f = tmp_path / "body.md"
+        f.write_text("# new\n")
+        with patch("gdoc.state.STATE_DIR", tmp_path):
+            with patch("gdoc.api.docs.get_document_with_tabs",
+                       return_value=_doc_with_tabs(("t.x", "X"))), \
+                 patch("gdoc.api.docs.insert_markdown_into_tab",
+                       return_value={"tab_id": "t.x", "tab_title": "X",
+                                     "insert_index": 1}), \
+                 patch("gdoc.api.drive.get_file_version",
+                       return_value={"version": 101}):
+                args = _write_args("abc123", "X", str(f), force=True)
+                assert cmd_write(args) == 0
+            st = load_state("abc123")
+            # Whole-doc baseline advanced: a following whole-doc write
+            # won't conflict against our own mutation.
+            assert st.last_read_version == 101
+            assert st.global_read_covers_doc is True
+            assert st.tab_read_versions == {"t.x": 101}
+
+
+class TestBlankTabRejected:
+    """F20: a blank --tab must error, not silently read as no tab."""
+
+    def test_blank_flag_tab_errors(self):
+        from gdoc.cli import _effective_tab
+
+        with pytest.raises(GdocError, match="non-empty") as exc:
+            _effective_tab("t.second", "  ")
+        assert exc.value.exit_code == 3

@@ -1,7 +1,8 @@
 # Per-tab read baselines for write-conflict detection
 
-Status: planned (discussed 2026-07-04/05, JP + Claude). Builds on PR #4 (URL `?tab=` support).
-Target version: 0.14.0.
+Status: **shipped in 0.20.0** (planned 2026-07-04/05 as 0.14.0, JP + Claude; renumbered
+after merging main, which had reused 0.13-0.19). Builds on the URL `?tab=` support in
+the same release. Kept as a design record — see CHANGELOG 0.20.0 for what shipped.
 
 > **Premise correction (2026-07-05, verified live):** the Drive markdown export includes
 > **all tabs**, not just the first — confirmed empirically against a real 7-tab doc (unique
@@ -134,7 +135,7 @@ anything — same as today's quiet behavior for `last_read_version`.
 
 4. **Docs**: README "Working with tabs" — fix the stale "export only returns the first
    tab" claim, and add a short "Conflict detection and tabs" paragraph (per-tab baselines,
-   the lenient rule, the `--force` escape, the sibling-edit caveat). CHANGELOG 0.14.0.
+   the lenient rule, the `--force` escape, the sibling-edit caveat). CHANGELOG 0.20.0.
    Bump version; sync `uv.lock`.
 
 ## Tests

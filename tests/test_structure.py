@@ -253,3 +253,29 @@ class TestStructureTabBaseline:
         args = _make_args(tab="Main")
         cmd_structure(args)
         assert mock_update.call_args.kwargs["read_tab_id"] is None
+
+
+@patch("gdoc.state.update_state_after_command")
+@patch("gdoc.api.docs.get_document_structure", return_value=_DOC)
+class TestStructureFieldsBaseline:
+    """F1: a --fields-masked response can't prove a full read, so it must
+    not advance any read baseline (global or per-tab)."""
+
+    def test_fields_read_is_partial(self, mock_get, mock_update):
+        args = _make_args(fields="tabs(tabProperties)")
+        cmd_structure(args)
+        kw = mock_update.call_args.kwargs
+        assert kw["command"] == "structure-partial"
+        assert kw.get("read_tab_id") is None
+
+    def test_fields_with_tab_stamps_nothing(self, mock_get, mock_update):
+        args = _make_args(tab="Notes", fields="tabs(tabProperties),revisionId")
+        cmd_structure(args)
+        kw = mock_update.call_args.kwargs
+        assert kw["command"] == "structure-partial"
+        assert kw.get("read_tab_id") is None
+
+    def test_unmasked_read_still_counts(self, mock_get, mock_update):
+        args = _make_args()
+        cmd_structure(args)
+        assert mock_update.call_args.kwargs["command"] == "structure"

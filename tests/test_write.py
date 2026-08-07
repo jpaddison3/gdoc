@@ -32,6 +32,11 @@ def _doc_with_tabs(*tabs):
     }
 
 
+def _read_state(version=10):
+    """State proving a whole-doc read at `version` (0.20 provenance)."""
+    return DocState(last_read_version=version, global_read_covers_doc=True)
+
+
 def _make_args(**overrides):
     """Build a SimpleNamespace mimicking parsed write args.
 
@@ -341,8 +346,11 @@ class TestWriteInSync:
         mock_doc.return_value = _doc_with_tabs(("t.notes", "Notes"))
         mock_pf.return_value = ChangeInfo(current_version=12, last_read_version=5)
         args = _make_args(file=str(f), tab="Notes")
-        with pytest.raises(GdocError, match="may have changed since last read"):
-            cmd_write(args)
+        with patch("gdoc.state.load_state", return_value=_read_state(5)):
+            with pytest.raises(
+                GdocError, match="may have changed since last read",
+            ):
+                cmd_write(args)
         mock_export.assert_not_called()
         mock_insert.assert_not_called()
 
@@ -803,7 +811,9 @@ class TestWriteTabScoped:
         the tab's own baseline instead."""
         f = tmp_path / "doc.md"
         f.write_text("body")
-        mock_doc.return_value = _doc_with_tabs(("t.a", "A"))
+        # Two tabs: a sole-tab write would legitimately count as a
+        # whole-doc write under the single-tab rule.
+        mock_doc.return_value = _doc_with_tabs(("t.a", "A"), ("t.b", "B"))
         mock_pf.return_value = ChangeInfo(
             current_version=10, last_read_version=5,
         )
@@ -816,13 +826,15 @@ class TestWriteTabScoped:
         assert mock_state.call_args.kwargs["full_doc_write"] is False
         assert mock_state.call_args.kwargs["written_tab_id"] == "t.a"
 
+    @patch("gdoc.state.load_state", return_value=_read_state())
     @patch("gdoc.api.docs.get_document_with_tabs")
     @patch("gdoc.state.update_state_after_command")
     @patch("gdoc.api.drive.get_file_version", return_value={"version": 11})
     @patch("gdoc.api.docs.insert_markdown_into_tab")
     @patch("gdoc.notify.pre_flight")
     def test_tab_scoped_uses_docs_api(
-        self, mock_pf, mock_insert, _ver, _update, mock_doc, tmp_path,
+        self, mock_pf, mock_insert, _ver, _update, mock_doc, _state,
+        tmp_path,
     ):
         f = tmp_path / "doc.md"
         f.write_text("# New body\n")
@@ -844,6 +856,7 @@ class TestWriteTabScoped:
             doc=mock_doc.return_value,
         )
 
+    @patch("gdoc.state.load_state", return_value=_read_state())
     @patch("gdoc.api.docs.get_document_with_tabs")
     @patch("gdoc.state.update_state_after_command")
     @patch("gdoc.api.drive.get_file_version", return_value={"version": 11})
@@ -853,7 +866,7 @@ class TestWriteTabScoped:
     @patch("gdoc.notify.pre_flight")
     def test_tab_scoped_does_not_touch_drive(
         self, mock_pf, mock_insert, mock_tabs, mock_update_doc, _ver,
-        _update, mock_doc, tmp_path,
+        _update, mock_doc, _state, tmp_path,
     ):
         f = tmp_path / "doc.md"
         f.write_text("body")
@@ -871,13 +884,15 @@ class TestWriteTabScoped:
         # --tab writes must not invoke it.
         mock_tabs.assert_not_called()
 
+    @patch("gdoc.state.load_state", return_value=_read_state())
     @patch("gdoc.api.docs.get_document_with_tabs")
     @patch("gdoc.state.update_state_after_command")
     @patch("gdoc.api.drive.get_file_version", return_value={"version": 11})
     @patch("gdoc.api.docs.insert_markdown_into_tab")
     @patch("gdoc.notify.pre_flight")
     def test_tab_scoped_strips_frontmatter(
-        self, mock_pf, mock_insert, _ver, _update, mock_doc, tmp_path,
+        self, mock_pf, mock_insert, _ver, _update, mock_doc, _state,
+        tmp_path,
     ):
         f = tmp_path / "doc.md"
         f.write_text(
@@ -900,6 +915,7 @@ class TestWriteTabScoped:
 class TestWriteUrlTab:
     """A ?tab= in the document URL drives the per-tab write path."""
 
+    @patch("gdoc.state.load_state", return_value=_read_state())
     @patch("gdoc.api.docs.get_document_with_tabs")
     @patch("gdoc.state.update_state_after_command")
     @patch("gdoc.api.drive.get_file_version", return_value={"version": 11})
@@ -908,11 +924,13 @@ class TestWriteUrlTab:
     @patch("gdoc.notify.pre_flight")
     def test_url_tab_writes_single_tab(
         self, mock_pf, mock_insert, mock_update_doc, _ver, mock_state,
-        mock_doc, tmp_path,
+        mock_doc, _lstate, tmp_path,
     ):
         f = tmp_path / "doc.md"
         f.write_text("# New body\n")
-        mock_doc.return_value = _doc_with_tabs(("t.second", "Second"))
+        mock_doc.return_value = _doc_with_tabs(
+            ("t.second", "Second"), ("t.first", "First"),
+        )
         mock_pf.return_value = ChangeInfo(
             current_version=10, last_read_version=10,
         )

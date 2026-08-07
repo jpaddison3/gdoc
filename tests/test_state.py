@@ -591,3 +591,41 @@ class TestCommentStatePatch:
             )
             state = load_state("doc1")
             assert state.last_comment_check == "2025-01-20T00:00:00Z"
+
+
+class TestMetadataOnlyTabHealing:
+    """Metadata-only bumps (mv/rename) carry per-tab baselines forward
+    when the post-op version is attributable to our own bump."""
+
+    def test_current_tab_entries_heal(self, tmp_path):
+        from gdoc.notify import ChangeInfo
+
+        with patch("gdoc.state.STATE_DIR", tmp_path):
+            save_state("doc1", DocState(
+                last_version=100,
+                tab_read_versions={"t.a": 100, "t.b": 90},
+            ))
+            info = ChangeInfo(current_version=100)
+            update_state_after_command(
+                "doc1", info, command="mv", quiet=False,
+                command_version=101, metadata_only_write=True,
+            )
+            st = load_state("doc1")
+            # Entry current at pre-flight heals; the stale one must not.
+            assert st.tab_read_versions == {"t.a": 101, "t.b": 90}
+
+    def test_unattributable_bump_leaves_tab_entries(self, tmp_path):
+        from gdoc.notify import ChangeInfo
+
+        with patch("gdoc.state.STATE_DIR", tmp_path):
+            save_state("doc1", DocState(
+                last_version=100, tab_read_versions={"t.a": 100},
+            ))
+            info = ChangeInfo(current_version=100)
+            # +2 jump: a concurrent edit slipped in; nothing heals.
+            update_state_after_command(
+                "doc1", info, command="mv", quiet=False,
+                command_version=102, metadata_only_write=True,
+            )
+            st = load_state("doc1")
+            assert st.tab_read_versions == {"t.a": 100}
