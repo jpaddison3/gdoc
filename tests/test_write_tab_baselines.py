@@ -186,7 +186,7 @@ class TestTabBaselineDecision:
     -edit conservatism, its message, and the --force escape."""
 
     @patch("gdoc.state.update_state_after_command")
-    @patch("gdoc.api.drive.get_file_version", return_value={"version": 11})
+    @patch("gdoc.api.drive.get_file_version", return_value={"version": 101})
     @patch("gdoc.api.docs.insert_markdown_into_tab")
     @patch("gdoc.api.docs.get_document_with_tabs")
     @patch("gdoc.state.load_state")
@@ -411,3 +411,41 @@ class TestBlankTabRejected:
         with pytest.raises(GdocError, match="non-empty") as exc:
             _effective_tab("t.second", "  ")
         assert exc.value.exit_code == 3
+
+
+class TestInfoDoesNotAuthorizeTabWrites:
+    """`info` shows metadata only: it advances the whole-doc guard's
+    baseline (status quo) but must not stamp whole-doc content provenance,
+    which is what authorizes tab-scoped writes."""
+
+    def test_info_does_not_set_provenance_marker(self, tmp_path):
+        from gdoc.state import update_state_after_command
+
+        with patch("gdoc.state.STATE_DIR", tmp_path):
+            update_state_after_command(
+                "abc123", ChangeInfo(current_version=100), command="info",
+                quiet=False, command_version=100,
+            )
+            st = load_state("abc123")
+            assert st.last_read_version == 100  # whole-doc guard status quo
+            assert st.global_read_covers_doc is False
+
+    def test_info_then_tab_write_blocked(self, tmp_path):
+        f = tmp_path / "body.md"
+        f.write_text("# new\n")
+        with patch("gdoc.state.STATE_DIR", tmp_path):
+            from gdoc.state import update_state_after_command
+
+            update_state_after_command(
+                "abc123", ChangeInfo(current_version=100), command="info",
+                quiet=False, command_version=100,
+            )
+            with patch("gdoc.api.docs.get_document_with_tabs",
+                       return_value=_doc_with_tabs(("t.x", "X"),
+                                                   ("t.y", "Y"))), \
+                 patch("gdoc.api.docs.insert_markdown_into_tab") as mi, \
+                 patch("gdoc.api.drive.get_file_version",
+                       return_value={"version": 100}):
+                with pytest.raises(GdocError, match="no read baseline"):
+                    cmd_write(_write_args("abc123", "X", str(f)))
+                mi.assert_not_called()

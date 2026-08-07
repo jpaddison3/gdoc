@@ -122,14 +122,18 @@ def update_state_after_command(
         if command == "info" and command_version is not None:
             state.last_version = command_version
             state.last_read_version = command_version
-            state.global_read_covers_doc = True
     elif change_info is not None:
         # Normal (non-quiet) run: update from pre-flight data
         if change_info.current_version is not None:
             state.last_version = change_info.current_version
             if is_read:
                 state.last_read_version = change_info.current_version
-                state.global_read_covers_doc = True
+                # `info` shows metadata only: it keeps the whole-doc
+                # guard's status quo (advancing last_read_version) but
+                # must not claim whole-doc *content* provenance — the
+                # marker is what authorizes tab-scoped writes.
+                if command != "info":
+                    state.global_read_covers_doc = True
             if read_tab_id is not None:
                 state.tab_read_versions[read_tab_id] = change_info.current_version
 

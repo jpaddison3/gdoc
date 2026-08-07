@@ -54,7 +54,7 @@ def _tabs_doc(*pairs):
     }
 
 
-def _read_state(version=10):
+def _read_state(version=11):
     """State proving a whole-doc read at `version` (0.20 provenance)."""
     from gdoc.state import DocState
 
@@ -311,8 +311,8 @@ class TestInsertConflict:
 
         f = tmp_path / "content.md"
         f.write_text("hi")
-        mock_pf.return_value = ChangeInfo(current_version=10)
-        state = DocState(tab_read_versions={"t.todo": 10})
+        mock_pf.return_value = ChangeInfo(current_version=11)
+        state = DocState(tab_read_versions={"t.todo": 11})
         with patch("gdoc.state.load_state", return_value=state), \
              patch("gdoc.state.update_state_after_command"), \
              patch(

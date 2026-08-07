@@ -32,7 +32,7 @@ def _doc_with_tabs(*tabs):
     }
 
 
-def _read_state(version=10):
+def _read_state(version=11):
     """State proving a whole-doc read at `version` (0.20 provenance)."""
     return DocState(last_read_version=version, global_read_covers_doc=True)
 
@@ -346,7 +346,9 @@ class TestWriteInSync:
         mock_doc.return_value = _doc_with_tabs(("t.notes", "Notes"))
         mock_pf.return_value = ChangeInfo(current_version=12, last_read_version=5)
         args = _make_args(file=str(f), tab="Notes")
-        with patch("gdoc.state.load_state", return_value=_read_state(5)):
+        with patch("gdoc.state.load_state", return_value=_read_state(5)), \
+             patch("gdoc.api.drive.get_file_version",
+                   return_value={"version": 12}):
             with pytest.raises(
                 GdocError, match="may have changed since last read",
             ):

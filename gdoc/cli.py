@@ -70,7 +70,10 @@ def _effective_tab(
     if flag_tab is not None:
         # A blank --tab would win precedence here but read as "no tab" at
         # every truthiness check downstream — a silent wrong-target. Reject.
-        if not flag_tab.strip():
+        # Return the stripped value: resolve_tab matches titles verbatim,
+        # so stray whitespace would pass this guard then "tab not found".
+        flag_tab = flag_tab.strip()
+        if not flag_tab:
             raise GdocError(
                 "--tab requires a non-empty tab title or id", exit_code=3,
             )
@@ -804,9 +807,7 @@ def cmd_insert(args) -> int:
     tab_match = resolve_tab(flatten_tabs(doc.get("tabs", [])), tab_name)
     tab_id = tab_match["id"]
 
-    _check_tab_write_conflict(
-        doc_id, tab_id, tab_name, quiet, force, change_info,
-    )
+    _check_tab_write_conflict(doc_id, tab_id, tab_name, force)
 
     result = insert_markdown_into_tab(
         doc_id, tab_name, content, position=position, replace=False, doc=doc,
@@ -1464,8 +1465,7 @@ def _raise_on_tab_conflict(tab_label: str, baseline, current_version) -> None:
 
 
 def _check_tab_write_conflict(
-    doc_id: str, tab_id: str, tab_label: str, quiet: bool, force: bool,
-    change_info=None,
+    doc_id: str, tab_id: str, tab_label: str, force: bool,
 ) -> None:
     """Conflict detection for a tab-scoped write (per-tab baseline).
 
@@ -1473,15 +1473,19 @@ def _check_tab_write_conflict(
     lenient rule: max(whole-doc last_read_version, this tab's read version).
     A plain `cat`/`pull` exports the whole doc (every tab), so the global
     baseline legitimately covers tab X; a `cat --tab X` or an earlier
-    `write --tab X` stamps X's own entry. (`info` also raises the global
-    baseline without showing content — a deliberate status-quo carry-over
-    from the whole-doc guard, not a per-tab guarantee.) Tab writes never
-    get the content-match rescue — a tab body is never the whole-doc
-    export — so no in_sync escape.
+    `write --tab X` stamps X's own entry. (`info` advances the whole-doc
+    guard's last_read_version but is excluded from the provenance marker,
+    so it never authorizes a tab-scoped write — it shows no content.)
+    Tab writes never get the content-match rescue — a tab body is never
+    the whole-doc export — so no in_sync escape.
 
-    The caller runs pre_flight/_require_doc first (cheap Drive metadata —
-    usage errors must surface before any expensive document fetch) and
-    passes the resulting change_info; under --quiet it passes None.
+    Call this AFTER fetching the document to write into: the current
+    version is re-derived here, post-fetch, because comparing against the
+    caller's pre-flight snapshot would miss an edit landing between
+    pre-flight and the fetch — the batchUpdate's requiredRevisionId pin
+    only guards edits after the fetch. (The caller still runs
+    pre_flight/_require_doc first so usage errors surface cheaply, at the
+    right exit code, before the expensive document fetch.)
     Raises GdocError(exit_code=3) on a real conflict.
     """
     if force:
@@ -1494,14 +1498,8 @@ def _check_tab_write_conflict(
         _tab_read_version(state, tab_id),
     )
 
-    if change_info is not None:
-        _raise_on_tab_conflict(tab_label, baseline, change_info.current_version)
-        return
-
-    # --quiet: short-circuit like _check_write_conflict's quiet branch —
-    # with no baseline the write is rejected regardless of the current
-    # version, so skip the get_file_version network call --quiet exists
-    # to avoid.
+    # With no baseline the write is rejected regardless of the current
+    # version, so skip the get_file_version network call.
     current_version = None
     if baseline is not None:
         from gdoc.api.drive import get_file_version
@@ -1573,9 +1571,7 @@ def cmd_write(args) -> int:
         tab_match = resolve_tab(all_tabs, tab_name)
         tab_id = tab_match["id"]
 
-        _check_tab_write_conflict(
-            doc_id, tab_id, tab_name, quiet, force, change_info,
-        )
+        _check_tab_write_conflict(doc_id, tab_id, tab_name, force)
 
         result = insert_markdown_into_tab(
             doc_id, tab_name, content, replace=True, doc=doc,
@@ -1583,8 +1579,10 @@ def cmd_write(args) -> int:
         # Note: this version is fetched AFTER the batchUpdate — unlike the
         # whole-doc path, whose files.update returns its own version
         # atomically. A concurrent edit landing in that sub-second window
-        # would be folded into the stamped baseline; accepted risk until
-        # the Docs API exposes the post-write version directly.
+        # would be folded into the stamped tab baseline — and on a
+        # single-tab doc, via full_doc_write below, into the whole-doc
+        # baseline too, exposing a later `push` to the same window.
+        # Accepted risk until the Docs API exposes the post-write version.
         command_version = get_file_version(doc_id).get("version")
         _print_tab_write_result(
             mode, doc_id, result, command_version, verb="wrote",
@@ -3131,8 +3129,10 @@ def cmd_structure(args) -> int:
         # the response is unmasked — a --fields response may omit tabIds,
         # sibling tabs, or the content itself, so it can't prove coverage
         # (the fields is None gate below keeps it from stamping anything).
+        # A missing tabId degrades to "" (fail-closed: not None, so the
+        # read never claims whole-doc provenance) — matching cmd_cat.
         if fields is None and len(flatten_tabs(doc.get("tabs", []))) > 1:
-            read_tab_id = tab.get("tabProperties", {}).get("tabId") or None
+            read_tab_id = tab.get("tabProperties", {}).get("tabId", "")
         out = {
             "documentId": doc.get("documentId", doc_id),
             "title": doc.get("title", ""),
