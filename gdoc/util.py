@@ -20,6 +20,17 @@ class AuthError(GdocError):
         super().__init__(message, exit_code=2)
 
 
+class PreviewUnavailableError(GdocError):
+    """A Docs API developer-preview feature isn't available to this caller.
+
+    Raised when a preview-gated batchUpdate request (e.g. insertComment) is
+    rejected because the Cloud project isn't enrolled in the Workspace
+    Developer Preview Program, or the user's access level can't batchUpdate.
+    Callers catch this to fall back to a generally-available code path; it
+    should never surface to the user as a failure.
+    """
+
+
 CONFIG_DIR = Path.home() / ".config" / "gdoc"
 _OLD_CONFIG_DIR = Path.home() / ".gdoc"
 
@@ -97,6 +108,37 @@ def set_default_account(account: str) -> None:
     _validate_account_name(account)
     config = _load_config()
     config["default_account"] = account
+    _save_config(config)
+
+
+_VALID_PAGE_MODES = ("pageless", "paged")
+
+
+def get_default_page_mode() -> str | None:
+    """Return the configured default page mode for docs created by `gdoc new`.
+
+    'pageless' or 'paged' if the user set one via `gdoc config --page-mode`,
+    else None — meaning "no explicit preference". A None result tells
+    `gdoc new` to leave the doc as the create path produced it: blank docs
+    inherit the account's page-mode default, and markdown-imported docs stay
+    paged. Defaulting to None rather than 'paged' avoids silently overriding a
+    pageless account default on the blank path.
+    """
+    mode = _load_config().get("page_mode")
+    if mode in _VALID_PAGE_MODES:
+        return mode
+    return None
+
+
+def set_default_page_mode(mode: str) -> None:
+    """Set the default page mode used by `gdoc new` when no flag is given."""
+    if mode not in _VALID_PAGE_MODES:
+        raise GdocError(
+            f"Invalid page mode: {mode!r}. Use 'pageless' or 'paged'.",
+            exit_code=3,
+        )
+    config = _load_config()
+    config["page_mode"] = mode
     _save_config(config)
 
 

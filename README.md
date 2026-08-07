@@ -145,6 +145,15 @@ gdoc images DOC_ID
 # Download images to a local directory
 gdoc images --download /tmp/imgs DOC_ID
 
+# Export a rendered PDF/DOCX/HTML file
+gdoc export DOC_ID --out report.pdf
+
+# Insert an image into an existing doc
+gdoc insert-image DOC_ID diagram.png --after "Architecture"
+
+# Replace an image's content in place (IDs from `gdoc images`)
+gdoc replace-image DOC_ID kix.abc123 diagram-v2.png
+
 # Read a spreadsheet (markdown table; --plain for TSV)
 gdoc cat SHEET_ID
 
@@ -178,7 +187,10 @@ gdoc cat 1aBcDeFg...
 | `info DOC` | Show title, owner, modified date, word count (tab list for spreadsheets) |
 | `ls [FOLDER]` | List files in Drive root or a folder (`--type docs\|sheets\|all`) |
 | `images DOC` | List images, charts, and drawings (`--download DIR` to save locally) |
-| `find QUERY` | Search files by name or content |
+| `find QUERY` | Search files by name or content (`--raw` to pass a full [Drive query](https://developers.google.com/workspace/drive/api/guides/search-files) verbatim) |
+| `drives` | List shared drives |
+| `export DOC --out FILE` | Render to `pdf`, `docx`, `odt`, `epub`, `html`, `md`, `txt`, or `rtf` (format inferred from the extension, or `--format`; all tabs included) |
+| `structure DOC` | Native document JSON — styles, tables, tab topology, UTF-16 index ranges (`--tab` to narrow, `--fields` for a raw field mask, `--suggestions-view-mode` to pick the suggestions rendering) |
 
 ### Writing
 
@@ -189,6 +201,8 @@ gdoc cat 1aBcDeFg...
 | `write DOC FILE` | Overwrite document from a local markdown file |
 | `cells SHEET RANGE` | Write values into a spreadsheet range (`-v VALUE` per cell, `--file rows.csv`, `--stdin` for TSV; `--append` adds rows, `--user-entered` parses formulas/dates) |
 | `new TITLE` | Create a blank document (`--folder` to specify location, `--file` to import markdown with images) |
+| `insert-image DOC IMG` | Insert a local image or public URL (`--after TEXT`, `--index N`, or `--end`; `--tab` for multi-tab docs; `--width`/`--height` in points) |
+| `replace-image DOC ID IMG` | Swap an image's content in place, keeping its size (IDs from `gdoc images`) |
 | `cp DOC TITLE` | Duplicate a document |
 
 ### Revisions & diffs
@@ -208,12 +222,28 @@ gdoc cat 1aBcDeFg...
 | Command | Description |
 |---------|-------------|
 | `comments DOC` | List all open comments (`--all` to include resolved) |
-| `comment DOC TEXT` | Add a comment (`--quote` to anchor to text) |
+| `comment DOC TEXT` | Add a comment (`--quote` to anchor it to text — see below) |
 | `comment-info DOC ID` | Get a single comment with full detail |
 | `reply DOC COMMENT_ID TEXT` | Reply to a comment |
 | `resolve DOC COMMENT_ID` | Resolve a comment (`--message` to include a note) |
 | `reopen DOC COMMENT_ID` | Reopen a resolved comment |
 | `delete-comment DOC ID` | Delete a comment (`--force` to skip confirmation) |
+
+`comment --quote "some doc text"` anchors the comment to the first occurrence
+of that text (all tabs are searched). When the OAuth client's Cloud project is
+enrolled in the
+[Google Workspace Developer Preview Program](https://developers.google.com/workspace/preview),
+this creates a **real anchored comment** via the Docs API `insertComment`
+request — highlighted in the Docs UI exactly like a comment made by hand
+(`OK comment #ID (anchored)`; `"anchored": true` in `--json`). Without preview
+access (or with comment-only permission on the doc, which can't `batchUpdate`),
+or when the quoted text isn't found in the document, it falls back
+transparently to the Drive API path: the comment is created unanchored
+(`anchored: false` in `--json`/`--plain`) with the quote stored as
+`quotedFileContent` metadata, which `cat --comments` matches client-side but
+the Docs UI does not highlight. Same command either way — anchoring problems
+never fail the comment (though unrelated API errors, like a missing doc or
+expired auth, still do).
 
 ### Other
 
@@ -221,6 +251,10 @@ gdoc cat 1aBcDeFg...
 |---------|-------------|
 | `auth` | Authenticate with Google (`--no-browser` for headless) |
 | `share DOC EMAIL` | Share a document (`--role reader\|writer\|commenter`) |
+| `share DOC --domain D` / `--anyone` | Link-based sharing with a Workspace domain or anyone with the link (`--discoverable` to also surface in search) |
+| `mkdir TITLE` | Create a Drive folder (`--parent FOLDER`) |
+| `mv DOC FOLDER` | Move a file into a folder (alias: `move`) |
+| `rename DOC TITLE` | Rename a file |
 | `update` | Update gdoc to the latest release |
 
 ## Output modes
@@ -486,6 +520,54 @@ gdoc images --download /tmp/imgs DOC kix.abc
 ```
 
 Drawings cannot be exported (the Google API exposes no content for them). Charts are rendered as images via their content URI. Downloaded files can be viewed directly by multimodal AI agents.
+
+## Image editing
+
+Add an image to an existing document, or swap one's content in place:
+
+```bash
+# Insert after anchor text (two matches = error; use a longer anchor)
+gdoc insert-image DOC diagram.png --after "Architecture"
+
+# Append at the end of a tab, with an explicit display size
+gdoc insert-image DOC https://example.org/chart.png --tab Notes --end --width 400
+
+# Replace an image's content, keeping its current size (center-cropped)
+gdoc replace-image DOC kix.abc123 diagram-v2.png
+```
+
+Multi-tab documents require `--tab` so the insert can't land in the wrong
+tab. Local files must be PNG, JPG, or GIF — the Docs API rejects WebP, so
+gdoc refuses it up front (markdown import via `new --file` still accepts
+WebP). Local files are uploaded to Drive as a temporary public-read file
+(Google's servers fetch the image by URL), then deleted immediately after
+the insert — if that cleanup ever fails, gdoc warns with the file ID
+instead of leaving the exposure silent.
+## Native structure
+
+`cat` is a prose view; `structure` is the editing model. It dumps the raw
+Docs API document JSON so an agent can derive exact native mutation
+targets — paragraph styles, table geometry, tab topology, inline objects,
+named ranges, and the UTF-16 `startIndex`/`endIndex` values every
+`batchUpdate` range needs:
+
+```bash
+# Whole document (compact JSON; --verbose to indent)
+gdoc structure DOC
+
+# One tab's subtree, plus documentId/revisionId
+gdoc structure DOC --tab Notes
+
+# Trim the payload with a raw field mask
+gdoc structure DOC --fields 'revisionId,tabs(tabProperties)'
+
+# Render suggestions as accepted/rejected before reading indexes
+gdoc structure DOC --suggestions-view-mode preview_suggestions_accepted
+```
+
+Two index caveats: Docs indices count UTF-16 code units (an emoji is two
+units, a smart chip is one), and the suggestions view mode changes both
+content and indexes — the mode used is echoed in the output.
 
 ## Command allowlist
 

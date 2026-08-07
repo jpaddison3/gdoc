@@ -43,43 +43,74 @@ def export_doc(doc_id: str, mime_type: str = "text/markdown") -> str:
 
     Returns the decoded UTF-8 content string.
     """
+    return export_doc_bytes(doc_id, mime_type).decode("utf-8")
+
+
+def export_doc_bytes(doc_id: str, mime_type: str) -> bytes:
+    """Export a Google Docs document as raw bytes.
+
+    Like export_doc, but without UTF-8 decoding — for binary formats
+    (PDF, DOCX, ODT, EPUB) that must be written to a file as-is.
+    """
     try:
         service = get_drive_service()
-        content = (
+        return (
             service.files()
             .export_media(fileId=doc_id, mimeType=mime_type)
             .execute()
         )
-        return content.decode("utf-8")
     except HttpError as e:
         _translate_http_error(e, doc_id)
 
 
-def list_files(query: str) -> list[dict]:
-    """List files matching a Drive API query, auto-paginating."""
+def list_files(query: str, all_drives: bool = False) -> list[dict]:
+    """List files matching a Drive API query, auto-paginating.
+
+    Args:
+        query: Drive API query string.
+        all_drives: Search the allDrives corpus (personal Drive plus
+            every shared drive the user is a member of) instead of the
+            default user corpus, which only covers files created by,
+            opened by, or shared directly with the user. Google may
+            answer broad-corpus queries with incompleteSearch=true; a
+            WARN is printed to stderr when that happens.
+    """
+    import sys
+
     try:
         service = get_drive_service()
         all_files: list[dict] = []
         page_token = None
+        incomplete = False
 
+        extra: dict = {"corpora": "allDrives"} if all_drives else {}
         while True:
             response = (
                 service.files()
                 .list(
                     q=query,
-                    fields="nextPageToken, files(id, name, mimeType, modifiedTime, modifiedByMeTime)",
+                    fields="nextPageToken, incompleteSearch, "
+                    "files(id, name, mimeType, modifiedTime, modifiedByMeTime)",
                     pageSize=100,
                     pageToken=page_token,
                     supportsAllDrives=True,
                     includeItemsFromAllDrives=True,
+                    **extra,
                 )
                 .execute()
             )
             all_files.extend(response.get("files", []))
+            incomplete = incomplete or response.get("incompleteSearch", False)
             page_token = response.get("nextPageToken")
             if page_token is None:
                 break
 
+        if incomplete:
+            print(
+                "WARN: Drive reported an incomplete search; "
+                "results may be partial",
+                file=sys.stderr,
+            )
         return all_files
     except HttpError as e:
         _translate_http_error(e, "")
@@ -276,11 +307,21 @@ def upload_temp_image(file_path: str, mime_type: str) -> dict:
             )
             .execute()
         )
-        # Make publicly readable for inline image insertion
-        service.permissions().create(
-            fileId=result["id"],
-            body={"type": "anyone", "role": "reader"},
-        ).execute()
+        # Make publicly readable for inline image insertion. If that is
+        # blocked (e.g. a Workspace policy forbids anyone-sharing), the
+        # caller never learns the file ID, so delete the orphan here
+        # rather than leaving a gdoc-temp-* file behind on every attempt.
+        try:
+            service.permissions().create(
+                fileId=result["id"],
+                body={"type": "anyone", "role": "reader"},
+            ).execute()
+        except HttpError:
+            try:
+                service.files().delete(fileId=result["id"]).execute()
+            except HttpError:
+                pass
+            raise
         return result
     except HttpError as e:
         _translate_http_error(e, file_path)
@@ -328,6 +369,138 @@ def create_doc(title: str, folder_id: str | None = None) -> dict:
         _translate_http_error(e, folder_id or "")
 
 
+def create_folder(title: str, parent_id: str | None = None) -> dict:
+    """Create a Drive folder.
+
+    Args:
+        title: Folder name.
+        parent_id: Optional parent folder ID (omitted → My Drive root).
+
+    Returns:
+        Dict with keys: id, name, webViewLink.
+    """
+    body: dict = {
+        "name": title,
+        "mimeType": "application/vnd.google-apps.folder",
+    }
+    if parent_id:
+        body["parents"] = [parent_id]
+    try:
+        service = get_drive_service()
+        return (
+            service.files()
+            .create(
+                body=body,
+                fields="id, name, webViewLink",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+    except HttpError as e:
+        _translate_http_error(e, parent_id or "")
+
+
+def move_file(file_id: str, folder_id: str) -> dict:
+    """Move a file into a folder, removing it from its current parents.
+
+    Drive files can technically have multiple parents (legacy); a move
+    replaces all of them so the file ends up in exactly one place.
+
+    Returns:
+        Dict with keys: id, name, parents, version (int).
+    """
+    try:
+        service = get_drive_service()
+        current = (
+            service.files()
+            .get(
+                fileId=file_id,
+                fields="id, name, parents, version",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+        parents = current.get("parents", [])
+        # Never add and remove the destination in the same request: a
+        # re-run mv, or a legacy multi-parent file that already includes
+        # the destination, must keep it.
+        to_remove = [p for p in parents if p != folder_id]
+        kwargs: dict = {}
+        if folder_id not in parents:
+            kwargs["addParents"] = folder_id
+        if to_remove:
+            kwargs["removeParents"] = ",".join(to_remove)
+        if not kwargs:
+            # Already exactly in the destination — nothing to write.
+            if "version" in current:
+                current["version"] = int(current["version"])
+            return current
+        result = (
+            service.files()
+            .update(
+                fileId=file_id,
+                fields="id, name, parents, version",
+                supportsAllDrives=True,
+                **kwargs,
+            )
+            .execute()
+        )
+        if "version" in result:
+            result["version"] = int(result["version"])
+        return result
+    except HttpError as e:
+        _translate_http_error(e, file_id)
+
+
+def rename_file(file_id: str, title: str) -> dict:
+    """Rename a Drive file.
+
+    Returns:
+        Dict with keys: id, name, version (int).
+    """
+    try:
+        service = get_drive_service()
+        result = (
+            service.files()
+            .update(
+                fileId=file_id,
+                body={"name": title},
+                fields="id, name, version",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+        if "version" in result:
+            result["version"] = int(result["version"])
+        return result
+    except HttpError as e:
+        _translate_http_error(e, file_id)
+
+
+def list_shared_drives() -> list[dict]:
+    """List shared drives the user can access, auto-paginating.
+
+    Returns list of dicts with keys: id, name.
+    """
+    try:
+        service = get_drive_service()
+        all_drives: list[dict] = []
+        page_token = None
+        while True:
+            response = (
+                service.drives()
+                .list(pageSize=100, pageToken=page_token)
+                .execute()
+            )
+            all_drives.extend(response.get("drives", []))
+            page_token = response.get("nextPageToken")
+            if page_token is None:
+                break
+        return all_drives
+    except HttpError as e:
+        _translate_http_error(e, "")
+
+
 def copy_doc(doc_id: str, title: str) -> dict:
     """Duplicate a Google Doc.
 
@@ -357,30 +530,61 @@ def copy_doc(doc_id: str, title: str) -> dict:
         _translate_http_error(e, doc_id)
 
 
-def create_permission(doc_id: str, email: str, role: str) -> dict:
-    """Share a document with a user.
+def create_permission(
+    doc_id: str,
+    email: str | None = None,
+    role: str = "reader",
+    domain: str | None = None,
+    anyone: bool = False,
+    discoverable: bool = False,
+) -> dict:
+    """Share a document with a user, a whole domain, or anyone with the link.
+
+    Exactly one of email / domain / anyone selects the grantee type; the
+    caller validates that. User shares send a notification email; domain
+    and anyone shares are link-based, with `discoverable` controlling
+    whether the file also appears in search results
+    (`allowFileDiscovery` — never inferred, off by default).
 
     Args:
         doc_id: Document ID.
-        email: Email address to share with.
+        email: Email address to share with (user grant).
         role: Permission role ('reader', 'writer', 'commenter').
+        domain: Workspace domain to share with (domain grant).
+        anyone: Share with anyone who has the link.
+        discoverable: Let the file surface in search (domain/anyone only).
 
     Returns:
         Permission resource dict from the API.
     """
+    kwargs: dict = {}
+    if email:
+        body: dict = {"type": "user", "role": role, "emailAddress": email}
+        kwargs["sendNotificationEmail"] = True
+    elif domain:
+        body = {
+            "type": "domain",
+            "role": role,
+            "domain": domain,
+            "allowFileDiscovery": discoverable,
+        }
+    elif anyone:
+        body = {
+            "type": "anyone",
+            "role": role,
+            "allowFileDiscovery": discoverable,
+        }
+    else:
+        raise GdocError("share target required (email, domain, or anyone)")
     try:
         service = get_drive_service()
         result = (
             service.permissions()
             .create(
                 fileId=doc_id,
-                body={
-                    "type": "user",
-                    "role": role,
-                    "emailAddress": email,
-                },
-                sendNotificationEmail=True,
+                body=body,
                 supportsAllDrives=True,
+                **kwargs,
             )
             .execute()
         )

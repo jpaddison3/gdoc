@@ -4,12 +4,20 @@ All notable changes to `gdoc` are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.14.0] — 2026-07-05
+## [0.20.0] — 2026-08-07
+
+### Added
+- **Document URLs honor their `?tab=` deep link.** Google's editor appends
+  `?tab=<id>` when you open a tab, so a pasted tab URL now acts exactly like
+  `--tab <id>` for `cat`, `edit` (incl. `--cell`), `write`, `insert`, and
+  `toc` — previously the tab was silently dropped and the command operated on
+  the first tab (or whole doc). An explicit `--tab`/`--all-tabs` still
+  overrides the URL.
 
 ### Fixed
 - **Per-tab write-conflict baselines.** The write guard now tracks a read
   baseline *per tab*, not just per document — a follow-up to the `?tab=` URL
-  support in 0.13.0. Two defects on multi-tab docs are fixed:
+  support above. Two defects on multi-tab docs are fixed:
   - **Cross-tab false negative.** `write --tab B` after only `cat --tab A`
     used to be satisfied by A's read and would replace tab B unseen. It now
     errors `no read baseline for tab 'B'` until you read B (or the whole doc).
@@ -28,22 +36,6 @@ All notable changes to `gdoc` are documented here. This project follows
 ### Changed
 - State files gain a `tab_read_versions` map. Older state files load unchanged
   (empty map); no migration needed.
-
-### Docs
-- Corrected the README Tabs section: the Drive export returns **all** tabs
-  (each under a `# **Tab title**` heading), not just the first.
-
-## [0.13.0] — 2026-07-04
-
-### Added
-- **Document URLs honor their `?tab=` deep link.** Google's editor appends
-  `?tab=<id>` when you open a tab, so a pasted tab URL now acts exactly like
-  `--tab <id>` for `cat`, `edit` (incl. `--cell`), `write`, `insert`, and
-  `toc` — previously the tab was silently dropped and the command operated on
-  the first tab (or whole doc). An explicit `--tab`/`--all-tabs` still
-  overrides the URL.
-
-### Changed
 - **`?tab=t.0` is treated as no tab.** The editor auto-appends `t.0` for the
   first tab, so it's ambient UI noise; honoring it would push the common
   pasted-URL case onto the lower-fidelity Docs-API renderer. It now stays on
@@ -61,6 +53,174 @@ All notable changes to `gdoc` are documented here. This project follows
   `--quiet`).
 - Spreadsheet `#gid=` deep links are still unparsed — select a worksheet with
   `--tab`/`--range`.
+
+### Docs
+- Corrected the README Tabs section: the Drive export returns **all** tabs
+  (each under a `# **Tab title**` heading), not just the first.
+
+## [0.19.0] — 2026-08-07
+
+### Added
+- **Folder and file management: `mkdir`, `mv`, `rename`, `drives`.**
+  `gdoc mkdir TITLE [--parent FOLDER]` creates a Drive folder;
+  `gdoc mv DOC FOLDER` (alias `move`) moves a file, replacing all its
+  current parents so it lands in exactly one place and reporting the
+  final location; `gdoc rename DOC TITLE` retitles a file; `gdoc drives`
+  lists shared drives. Moves and renames run the pre-flight awareness
+  check and fold their own version bump into the doc's state baseline so
+  the next command doesn't report a spurious edit; since they never touch
+  content, a read baseline that was current at pre-flight is carried
+  forward too, so a following `edit`/`write`/`push` doesn't see gdoc's
+  own metadata bump as an external conflict. (#39)
+- **Raw Drive queries: `find --raw`.** `gdoc find --raw "QUERY"` passes
+  the query string to the Drive API verbatim (full query language:
+  `mimeType=…`, `'me' in owners`, `modifiedTime > …`), while plain
+  `find QUERY` keeps its simple escaped name/content search. Raw queries
+  search the `allDrives` corpus — personal Drive plus every shared drive
+  the user is a member of — and warn on stderr if Google reports the
+  search came back incomplete. (#39)
+- **Domain and anyone-with-link sharing.** `gdoc share DOC --domain
+  example.org` and `gdoc share DOC --anyone` create link-based
+  permissions alongside the existing per-user email shares.
+  Discoverability (`allowFileDiscovery`) is never inferred: it's off
+  unless `--discoverable` is passed, and that flag is rejected for
+  per-user shares. Exactly one share target (email, `--domain`,
+  `--anyone`) is required. User-share output keys are unchanged;
+  domain/anyone shares report `target`, `type`, and `discoverable`. (#39)
+
+## [0.18.0] — 2026-08-07
+
+### Added
+- **`gdoc export` — render a document to PDF, DOCX, and more.**
+  `gdoc export DOC --out report.pdf` writes a rendered artifact via Drive
+  export; the format is inferred from the `--out` extension or set with
+  `--format` (`pdf`, `docx`, `odt`, `epub`, `html`, `md`, `txt`, `rtf`).
+  Binary formats require `--out` (no PDF bytes to a terminal); text
+  formats print to stdout without it. Exports cover the whole document,
+  all tabs included. (#35)
+- **`gdoc insert-image` — add an image to an existing document.**
+  Takes a local file (PNG/JPG/GIF — the Docs API rejects WebP, so it is
+  refused before any upload) or a public image URL, anchored
+  by `--after TEXT` (retries with smart-quote folding; ambiguous anchors
+  are refused), a raw `--index`, or `--end`; `--width`/`--height` set the
+  display size in points (validated as positive finite numbers before
+  anything is uploaded). Multi-tab documents require `--tab`, and the
+  write is pinned to the read revision via
+  `writeControl.requiredRevisionId`. Local files are uploaded to Drive as
+  a temporary public-read file and deleted after the insert — a failed
+  cleanup warns with the file ID instead of leaving the exposure silent,
+  and if a Workspace policy blocks the public share the just-created
+  file is deleted rather than orphaned. Prints the new image object
+  ID. (#35)
+- **`gdoc replace-image` — swap an image's content by object ID.**
+  `gdoc replace-image DOC OBJECT_ID new.png` replaces the image content
+  in place (IDs from `gdoc images`), keeping the existing display size
+  (CENTER_CROP). The owning tab is located automatically, including
+  nested child tabs. (#35)
+
+### Fixed
+- **`gdoc images` now lists objects from every tab.** It previously
+  walked only the legacy first-tab fields, so images in other tabs were
+  invisible — including to the `replace-image` workflow that points
+  users at it for object IDs. Entries gain a `tab` field (`--plain`
+  appends it as a final column).
+
+## [0.17.0] — 2026-08-07
+
+### Added
+- **`gdoc structure` — native document JSON for structure-aware edits.**
+  Dumps the raw `documents.get` response: tab topology, paragraph and
+  text styles, tables, inline objects, named ranges, headers/footers,
+  and the UTF-16 `startIndex`/`endIndex` values needed to derive safe
+  native mutation ranges without parsing Markdown (Docs indices are
+  UTF-16 code units, not Python character offsets — a smart chip
+  occupies one code unit). Tab content is always included; narrow big
+  documents with `--tab TITLE|ID` (returns that tab's raw subtree plus
+  `documentId`/`revisionId`) or `--fields MASK` (passed verbatim;
+  Google rejects masks that recursively expand `childTabs`).
+  `--suggestions-view-mode` selects how suggestions are rendered — it
+  changes content and indexes, so the mode used is echoed in the
+  output. Output is always JSON: compact by default, indented with
+  `--verbose`, wrapped in the standard `ok` envelope with `--json`.
+  Read-only; runs pre-flight and counts as a full read for the
+  awareness baseline (like `cat`). (#33)
+
+## [0.14.0] — 2026-08-07
+
+### Added
+- **Real anchored comments via the Docs API (Developer Preview).**
+  `comment --quote "doc text"` now tries the Docs API `insertComment`
+  batchUpdate request first: the quote is located in the document (every
+  tab is searched, retrying with smart-quote/dash folding) and the comment
+  is anchored to that range — pinned to the searched revision via
+  `writeControl.requiredRevisionId` — so it shows up highlighted in the
+  Docs UI like a comment made by hand. The request is gated behind the
+  Google Workspace Developer Preview Program; when it's unavailable —
+  project not enrolled (400 for the unknown request type), comment-only
+  access that can't `batchUpdate` (403), or the doc changed between read
+  and write — the command falls back transparently to the existing Drive
+  `quotedFileContent` path, so behavior for non-preview users is unchanged.
+  Terse output gains an `(anchored)` suffix on success; `--json` and
+  `--plain` report `anchored` true/false whenever `--quote` is given. Adds
+  the `insert_comment` Docs API helper and a `PreviewUnavailableError`
+  sentinel (a `GdocError` subclass callers catch to fall back — it never
+  surfaces to the user).
+
+### Fixed
+- **Text search used Python code-point indices, not UTF-16.** Docs API
+  indices count UTF-16 code units, so in documents containing non-BMP
+  characters (emoji), `find_text_in_document` returned ranges shifted left
+  of the real match — affecting `edit` replacements as well as comment
+  anchoring. Offsets now advance by UTF-16 width.
+
+## [0.13.0] — 2026-07-14
+
+### Added
+- **Configurable page mode for `gdoc new`.** New docs can be created pageless
+  or paged. Drive's markdown importer always produces *paged* docs (it ignores
+  the account's pageless default), so docs made via `new --file` came out
+  paged regardless of preference. `gdoc new` now applies an explicit page mode
+  after creating the doc: a `--pageless` / `--paged` flag overrides a persisted
+  default set with `gdoc config --page-mode {pageless,paged}` (stored in
+  `~/.config/gdoc/config.json`). With **no flag and no configured default**,
+  the doc is left exactly as the create path produced it — a blank `gdoc new`
+  still inherits the account's pageless/paged default, and markdown imports
+  stay paged — so the feature never silently overrides an account preference.
+  Applying the mode is best-effort — a failure (of any kind) warns on stderr
+  but does not fail the creation, and the write's version bump is folded into
+  the doc's state baseline so it doesn't surface as a spurious change. Adds a
+  `config` subcommand (honors `--json`/`--verbose`/`--plain`) and the
+  `set_page_mode` Docs API helper
+  (`updateDocumentStyle` → `documentFormat.documentMode`).
+
+### Fixed
+- **`new --file` with images seeded a stale version baseline.** Image inserts
+  advance the doc's Drive version after creation, but state was seeded with
+  the create-time version, so the next command reported a spurious
+  "doc edited" change. The version is now re-read (best-effort) after image
+  insertion, matching the page-mode write's baseline handling.
+
+## [0.12.1] — 2026-07-07
+
+### Fixed
+- **Per-tab `cat` now preserves headings.** `cat --tab` / `cat --all-tabs`
+  built their output from a plain-text extractor that ignored
+  `paragraphStyle`, so headings came back as plain paragraphs (the whole-doc
+  Drive export already emitted `#` headings). A read-modify-write cycle
+  through `cat --tab` → `edit`/`insert` therefore silently demoted the
+  previous heading to body text. `get_tab_text(..., markdown=True)` now
+  prefixes heading paragraphs with the matching number of `#` marks, and
+  default `cat --tab`/`--all-tabs` request it. `cat --plain --tab` is
+  unchanged — it still returns the verbatim text `edit` matches against.
+- **Per-tab `cat` now renders inline formatting and lists.** Extending the
+  markdown export above, `cat --tab` / `cat --all-tabs` now emit `**bold**`,
+  `*italic*`, `~~strikethrough~~`, `[text](url)` links, and bullet/numbered
+  lists (nested, two spaces per level, ordered items counted 1, 2, 3 —
+  ordered vs bullet read from the tab's list glyph map). Previously these all
+  flattened to plain text on read even though `insert`/`write --tab` could
+  produce them. `cat --plain --tab` remains verbatim. Not yet rendered:
+  inline code, blockquotes, and markdown tables (tables still export as
+  tab-separated cells).
 
 ## [0.12.0] — 2026-06-22
 

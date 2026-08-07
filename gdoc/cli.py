@@ -398,6 +398,10 @@ def cmd_cat(args) -> int:
         tabs = get_document_tabs(doc_id)
         read_tab_id = None
 
+        # Default view renders markdown (headings survive round-trips);
+        # --plain returns the verbatim text gdoc edit matches against.
+        want_md = not getattr(args, "plain", False)
+
         if tab:
             match = resolve_tab(tabs, tab)
             # On a multi-tab doc a `--tab` read covers only that tab, so it
@@ -407,7 +411,7 @@ def cmd_cat(args) -> int:
             # whole-doc write/push would be spuriously blocked for no baseline.
             if len(tabs) > 1:
                 read_tab_id = match["id"]
-            content = get_tab_text(match)
+            content = get_tab_text(match, markdown=want_md)
             if no_images:
                 from gdoc.mdimport import strip_images
                 content = strip_images(content)
@@ -424,7 +428,7 @@ def cmd_cat(args) -> int:
             parts = []
             for t in tabs:
                 parts.append(f"=== Tab: {t['title']} ===\n")
-                parts.append(get_tab_text(t))
+                parts.append(get_tab_text(t, markdown=want_md))
             content = "".join(parts)
             if no_images:
                 from gdoc.mdimport import strip_images
@@ -1053,11 +1057,25 @@ def cmd_ls(args) -> int:
 
 def cmd_find(args) -> int:
     """Handler for `gdoc find`."""
-    from gdoc.api.drive import search_files
     from gdoc.format import get_output_mode
 
     title_only = getattr(args, "title", False)
-    files = search_files(args.query, title_only=title_only)
+    if getattr(args, "raw", False):
+        if title_only:
+            raise GdocError(
+                "--raw and --title are mutually exclusive "
+                "(put name conditions in the raw query)",
+                exit_code=3,
+            )
+        from gdoc.api.drive import list_files
+
+        # Raw queries are the broad-search path: cover shared drives the
+        # user belongs to, not just the default user corpus.
+        files = list_files(args.query, all_drives=True)
+    else:
+        from gdoc.api.drive import search_files
+
+        files = search_files(args.query, title_only=title_only)
 
     mode = get_output_mode(args)
     output = _format_file_list(files, mode)
@@ -2237,6 +2255,48 @@ def cmd_comments(args) -> int:
     return 0
 
 
+def _try_anchored_comment(doc_id: str, text: str, quote: str) -> str:
+    """Create a truly anchored comment via the Docs API preview, if possible.
+
+    Searches every tab for the first occurrence of *quote* (exact match
+    across all tabs first, then retrying with typography folding) and
+    anchors an insertComment request to that range, pinned to the revision
+    that was searched. Returns the new comment ID, or "" when the caller
+    should fall back to the Drive quotedFileContent path: quote text not
+    found, or the preview request unavailable (project not enrolled,
+    comment-only access, or the doc changed since the read).
+    """
+    from gdoc.api.docs import (
+        find_text_in_document,
+        flatten_tabs,
+        get_document_with_tabs,
+        insert_comment,
+    )
+    from gdoc.util import PreviewUnavailableError
+
+    document = get_document_with_tabs(doc_id)
+    revision_id = document.get("revisionId", "")
+    tabs = flatten_tabs(document.get("tabs", []))
+    if not tabs:
+        tabs = [{"id": None, "body": document.get("body", {})}]
+    for normalize in (False, True):
+        for tab in tabs:
+            matches = find_text_in_document(
+                None, quote, body=tab["body"], normalize=normalize,
+            )
+            if not matches:
+                continue
+            try:
+                return insert_comment(
+                    doc_id, text,
+                    matches[0]["startIndex"], matches[0]["endIndex"],
+                    tab_id=tab["id"], revision_id=revision_id,
+                )
+            except PreviewUnavailableError:
+                return ""
+    return ""
+
+
 def cmd_comment(args) -> int:
     """Handler for `gdoc comment`."""
     doc_id = _resolve_doc_id(args.doc)
@@ -2245,10 +2305,15 @@ def cmd_comment(args) -> int:
     from gdoc.notify import pre_flight
     change_info = pre_flight(doc_id, quiet=quiet)
 
-    from gdoc.api.comments import create_comment
     quote = getattr(args, "quote", "") or ""
-    result = create_comment(doc_id, args.text, quote=quote)
-    new_id = result["id"]
+    new_id = ""
+    if quote:
+        new_id = _try_anchored_comment(doc_id, args.text, quote)
+    anchored = bool(new_id)
+    if not anchored:
+        from gdoc.api.comments import create_comment
+        result = create_comment(doc_id, args.text, quote=quote)
+        new_id = result["id"]
 
     from gdoc.api.drive import get_file_version
     command_version = get_file_version(doc_id).get("version")
@@ -2256,11 +2321,15 @@ def cmd_comment(args) -> int:
     from gdoc.format import get_output_mode, format_json
     mode = get_output_mode(args)
     if mode == "json":
-        print(format_json(id=new_id, status="created"))
+        extra = {"anchored": anchored} if quote else {}
+        print(format_json(id=new_id, status="created", **extra))
     elif mode == "plain":
         print(f"id\t{new_id}")
+        if quote:
+            print(f"anchored\t{'true' if anchored else 'false'}")
     else:
-        print(f"OK comment #{new_id}")
+        suffix = " (anchored)" if anchored else ""
+        print(f"OK comment #{new_id}{suffix}")
 
     from gdoc.state import update_state_after_command
     update_state_after_command(
@@ -2538,6 +2607,7 @@ def cmd_images(args) -> int:
                 print(
                     f"{img['id']}\t{img['type']}\t{img['title']}"
                     f"\t{img['width_pt']}\t{img['height_pt']}"
+                    f"\t{img.get('tab', '')}"
                 )
         elif not images:
             print("No images.")
@@ -2559,6 +2629,459 @@ def cmd_images(args) -> int:
         doc_id, change_info, command="images", quiet=quiet,
     )
 
+    return 0
+
+
+# Rendered/binary formats must go to a file; text formats may hit stdout.
+_EXPORT_MIME = {
+    "pdf": "application/pdf",
+    "docx": (
+        "application/vnd.openxmlformats-officedocument"
+        ".wordprocessingml.document"
+    ),
+    "odt": "application/vnd.oasis.opendocument.text",
+    "epub": "application/epub+zip",
+    "html": "text/html",
+    "md": "text/markdown",
+    "txt": "text/plain",
+    "rtf": "application/rtf",
+}
+_BINARY_FORMATS = {"pdf", "docx", "odt", "epub"}
+_EXT_TO_FORMAT = {
+    ".pdf": "pdf",
+    ".docx": "docx",
+    ".odt": "odt",
+    ".epub": "epub",
+    ".html": "html",
+    ".htm": "html",
+    ".md": "md",
+    ".markdown": "md",
+    ".txt": "txt",
+    ".rtf": "rtf",
+}
+
+
+def cmd_export(args) -> int:
+    """Handler for `gdoc export`: render a doc to PDF/DOCX/HTML/etc."""
+    doc_id = _resolve_doc_id(args.doc)
+    quiet = getattr(args, "quiet", False)
+    fmt = getattr(args, "format", None)
+    out = getattr(args, "out", None)
+
+    if not fmt:
+        ext = os.path.splitext(out or "")[1].lower()
+        fmt = _EXT_TO_FORMAT.get(ext)
+        if not fmt:
+            raise GdocError(
+                "cannot infer format; pass --format or use a known "
+                "--out extension (" + ", ".join(sorted(_EXPORT_MIME)) + ")",
+                exit_code=3,
+            )
+    if fmt in _BINARY_FORMATS and not out:
+        raise GdocError(
+            f"--out is required for binary formats ({fmt})", exit_code=3,
+        )
+
+    from gdoc.notify import pre_flight
+
+    change_info = pre_flight(doc_id, quiet=quiet)
+    _require_doc(doc_id, change_info)
+
+    from gdoc.api.drive import export_doc_bytes
+
+    content = export_doc_bytes(doc_id, _EXPORT_MIME[fmt])
+
+    if out:
+        try:
+            with open(out, "wb") as f:
+                f.write(content)
+        except OSError as e:
+            raise GdocError(f"cannot write {out}: {e}", exit_code=3) from e
+
+        from gdoc.format import format_json, get_output_mode
+
+        mode = get_output_mode(args)
+        if mode == "json":
+            print(format_json(path=out, format=fmt, bytes=len(content)))
+        elif mode == "plain":
+            print(f"path\t{out}")
+            print(f"format\t{fmt}")
+            print(f"bytes\t{len(content)}")
+        elif mode == "verbose":
+            print(f"Exported: {doc_id}")
+            print(f"Format: {fmt}")
+            print(f"Path: {out}")
+            print(f"Bytes: {len(content)}")
+        else:
+            print(f"OK exported {out} ({fmt}, {len(content)} bytes)")
+    else:
+        from gdoc.format import format_json, get_output_mode
+
+        text = content.decode("utf-8")
+        if get_output_mode(args) == "json":
+            print(format_json(format=fmt, bytes=len(content), content=text))
+        else:
+            # terse/plain/verbose: the document content IS the output
+            sys.stdout.write(text)
+
+    from gdoc.state import update_state_after_command
+
+    update_state_after_command(
+        doc_id, change_info, command="export", quiet=quiet,
+    )
+    return 0
+
+
+# Formats the Docs API insertInlineImage/replaceImage requests accept.
+# Deliberately narrower than markdown import (`new --file` also takes
+# WebP): the API rejects WebP, and failing fast here avoids creating a
+# public-read temp file that the API is guaranteed to refuse
+# (live-verified: 400 "should be ... in supported formats").
+_INSERT_IMAGE_MIMES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+}
+
+
+def _validate_image_source(image: str) -> str | None:
+    """Validate an image argument (URL or local path).
+
+    Returns the local file's MIME type, or None for a remote URL.
+    Raises GdocError (exit 3) for a missing file or unsupported type,
+    so handlers can fail fast before making API calls.
+    """
+    if image.startswith(("http://", "https://")):
+        return None
+
+    if not os.path.isfile(image):
+        raise GdocError(f"image file not found: {image}", exit_code=3)
+
+    ext = os.path.splitext(image)[1].lower()
+    mime = _INSERT_IMAGE_MIMES.get(ext)
+    if not mime:
+        raise GdocError(
+            f"unsupported image type: {ext or image} "
+            "(the Docs API accepts png, jpg, gif)",
+            exit_code=3,
+        )
+    return mime
+
+
+def _resolve_image_source(image: str) -> tuple[str, str | None]:
+    """Turn an image argument (URL or local path) into an insertable URI.
+
+    Local files are uploaded to Drive as a temporary public-read file
+    (Google's servers must be able to fetch the URI); the caller must
+    delete the returned temp file ID when done.
+
+    Returns (uri, temp_file_id) — temp_file_id is None for remote URLs.
+    """
+    mime = _validate_image_source(image)
+    if mime is None:
+        return image, None
+
+    from gdoc.api.drive import upload_temp_image
+
+    result = upload_temp_image(image, mime)
+    uri = result.get("webContentLink")
+    if not uri:
+        # The temp file is already public-read; don't leak it just
+        # because Drive omitted the download link from the response.
+        _cleanup_temp_image(result.get("id"))
+        raise GdocError(
+            "Drive returned no download link for the temporary image "
+            "upload; try again"
+        )
+    return uri, result["id"]
+
+
+def _cleanup_temp_image(temp_file_id: str | None) -> None:
+    """Delete a temp Drive image, warning loudly if the delete fails.
+
+    The temp file is public-read (that's how Docs fetches it), so a failed
+    cleanup is an exposure the user must know about, not a silent leak.
+    """
+    if not temp_file_id:
+        return
+    from gdoc.api.drive import delete_file
+
+    try:
+        delete_file(temp_file_id)
+    except Exception as e:
+        print(
+            f"WARN: could not delete temporary Drive file {temp_file_id} "
+            f"(public-read); delete it manually: {e}",
+            file=sys.stderr,
+        )
+
+
+def _resolve_image_target_tab(doc: dict, tab_name: str | None) -> dict | None:
+    """Pick the tab an image operation targets; None = legacy body.
+
+    A multi-tab document with no --tab is ambiguous — refuse rather than
+    guess, since an insert lands at a raw index.
+    """
+    from gdoc.api.docs import flatten_tabs, resolve_tab
+
+    tabs = flatten_tabs(doc.get("tabs", []))
+    if tab_name:
+        return resolve_tab(tabs, tab_name)
+    if len(tabs) > 1:
+        raise GdocError(
+            f"document has {len(tabs)} tabs; specify --tab", exit_code=3,
+        )
+    return tabs[0] if tabs else None
+
+
+def _resolve_insert_index(
+    body: dict, index: int | None, after: str | None,
+) -> int:
+    """Resolve the UTF-16 insertion index from --index, --after, or --end."""
+    from gdoc.api.docs import find_text_in_document
+
+    if index is not None:
+        if index < 1:
+            raise GdocError("--index must be >= 1", exit_code=3)
+        return index
+    if after is not None:
+        matches = find_text_in_document(None, after, body=body)
+        if not matches:
+            matches = find_text_in_document(
+                None, after, body=body, normalize=True,
+            )
+        if not matches:
+            from gdoc.api.docs import diagnose_no_match
+
+            # normalize=True was already retried above, so don't let the
+            # diagnosis suggest it.
+            reason = diagnose_no_match(
+                None, after, body=body, already_normalized=True,
+            )
+            msg = f"--after anchor not found: {after!r}"
+            if reason:
+                msg += f"; {reason}"
+            raise GdocError(msg, exit_code=3)
+        if len(matches) > 1:
+            raise GdocError(
+                f"--after anchor is ambiguous ({len(matches)} matches); "
+                "use a longer anchor",
+                exit_code=3,
+            )
+        return matches[0]["endIndex"]
+    # --end: last index inside the body's final structural element
+    # (the segment's closing newline — inserting there appends).
+    content = body.get("content", [])
+    return content[-1].get("endIndex", 2) - 1 if content else 1
+
+
+def cmd_insert_image(args) -> int:
+    """Handler for `gdoc insert-image`: add an image to an existing doc."""
+    import math
+
+    doc_id = _resolve_doc_id(args.doc)
+    quiet = getattr(args, "quiet", False)
+    for name in ("width", "height"):
+        val = getattr(args, name, None)
+        if val is not None and (not math.isfinite(val) or val <= 0):
+            raise GdocError(
+                f"--{name} must be a positive number of points",
+                exit_code=3,
+            )
+    _validate_image_source(args.image)
+
+    from gdoc.notify import pre_flight
+
+    change_info = pre_flight(doc_id, quiet=quiet)
+    _require_doc(doc_id, change_info)
+    if change_info and change_info.has_conflict:
+        print("WARN: doc changed since last read", file=sys.stderr)
+
+    from gdoc.api.docs import get_document_with_tabs
+
+    doc = get_document_with_tabs(doc_id)
+    revision_id = doc.get("revisionId", "")
+    tab = _resolve_image_target_tab(doc, getattr(args, "tab", None))
+    tab_id = tab["id"] if tab else None
+    body = tab["body"] if tab else doc.get("body", {})
+
+    insert_at = _resolve_insert_index(
+        body, getattr(args, "index", None), getattr(args, "after", None),
+    )
+
+    uri, temp_file_id = _resolve_image_source(args.image)
+
+    from gdoc.api.docs import insert_inline_image
+
+    try:
+        object_id = insert_inline_image(
+            doc_id, uri, insert_at,
+            tab_id=tab_id,
+            revision_id=revision_id,
+            width_pt=getattr(args, "width", None),
+            height_pt=getattr(args, "height", None),
+        )
+    finally:
+        _cleanup_temp_image(temp_file_id)
+
+    from gdoc.api.drive import get_file_version
+
+    command_version = get_file_version(doc_id).get("version")
+
+    from gdoc.format import format_json, get_output_mode
+
+    mode = get_output_mode(args)
+    if mode == "json":
+        print(format_json(
+            object_id=object_id, tab=tab_id or "", index=insert_at,
+        ))
+    elif mode == "plain":
+        print(f"object_id\t{object_id}")
+        print(f"index\t{insert_at}")
+    elif mode == "verbose":
+        print(f"Inserted image: {object_id}")
+        print(f"Index: {insert_at}")
+        if tab_id:
+            print(f"Tab: {tab_id}")
+    else:
+        print(f"OK inserted image {object_id}")
+
+    from gdoc.state import update_state_after_command
+
+    update_state_after_command(
+        doc_id, change_info, command="insert-image",
+        quiet=quiet, command_version=command_version,
+    )
+    return 0
+
+
+def cmd_replace_image(args) -> int:
+    """Handler for `gdoc replace-image`: swap an image's content by ID."""
+    doc_id = _resolve_doc_id(args.doc)
+    object_id = args.object_id
+    quiet = getattr(args, "quiet", False)
+    _validate_image_source(args.image)
+
+    from gdoc.notify import pre_flight
+
+    change_info = pre_flight(doc_id, quiet=quiet)
+    _require_doc(doc_id, change_info)
+    if change_info and change_info.has_conflict:
+        print("WARN: doc changed since last read", file=sys.stderr)
+
+    from gdoc.api.docs import find_object_tab, get_document_with_tabs
+
+    doc = get_document_with_tabs(doc_id)
+    revision_id = doc.get("revisionId", "")
+    tab_id = find_object_tab(doc, object_id)
+    if tab_id is None and object_id not in doc.get("inlineObjects", {}):
+        raise GdocError(
+            f"image object not found: {object_id} (see `gdoc images`)",
+            exit_code=3,
+        )
+
+    uri, temp_file_id = _resolve_image_source(args.image)
+
+    from gdoc.api.docs import replace_image
+
+    try:
+        replace_image(
+            doc_id, object_id, uri,
+            tab_id=tab_id, revision_id=revision_id,
+        )
+    finally:
+        _cleanup_temp_image(temp_file_id)
+
+    from gdoc.api.drive import get_file_version
+
+    command_version = get_file_version(doc_id).get("version")
+
+    from gdoc.format import format_json, get_output_mode
+
+    mode = get_output_mode(args)
+    if mode == "json":
+        print(format_json(object_id=object_id, status="replaced"))
+    elif mode == "plain":
+        print(f"object_id\t{object_id}")
+        print("status\treplaced")
+    elif mode == "verbose":
+        print(f"Replaced image: {object_id}")
+        print("Method: CENTER_CROP (existing size kept)")
+    else:
+        print(f"OK replaced image {object_id}")
+
+    from gdoc.state import update_state_after_command
+
+    update_state_after_command(
+        doc_id, change_info, command="replace-image",
+        quiet=quiet, command_version=command_version,
+    )
+    return 0
+
+
+def cmd_structure(args) -> int:
+    """Handler for `gdoc structure`: raw document JSON for native edits."""
+    import json
+
+    doc_id = _resolve_doc_id(args.doc)
+    quiet = getattr(args, "quiet", False)
+    tab_name = getattr(args, "tab", None)
+    fields = getattr(args, "fields", None)
+    svm = getattr(args, "suggestions_view_mode", None)
+    svm = svm.upper() if svm else None
+
+    from gdoc.notify import pre_flight
+
+    change_info = pre_flight(doc_id, quiet=quiet)
+    _require_doc(doc_id, change_info)
+
+    from gdoc.api.docs import get_document_structure
+
+    doc = get_document_structure(
+        doc_id, fields=fields, suggestions_view_mode=svm,
+    )
+    # Indexes depend on the suggestions view; when a mode was explicitly
+    # requested but the response doesn't echo it, state it ourselves.
+    if svm and "suggestionsViewMode" not in doc:
+        doc = {**doc, "suggestionsViewMode": svm}
+
+    if tab_name:
+        from gdoc.api.docs import resolve_raw_tab
+
+        tab = resolve_raw_tab(doc.get("tabs", []), tab_name)
+        if tab is None:
+            raise GdocError(
+                f"tab not found: {tab_name} "
+                "(with --fields, the mask must keep tabProperties)",
+                exit_code=3,
+            )
+        out = {
+            "documentId": doc.get("documentId", doc_id),
+            "title": doc.get("title", ""),
+            "revisionId": doc.get("revisionId", ""),
+            "tab": tab,
+        }
+        if doc.get("suggestionsViewMode"):
+            out["suggestionsViewMode"] = doc["suggestionsViewMode"]
+    else:
+        out = doc
+
+    from gdoc.format import format_json, get_output_mode
+
+    mode = get_output_mode(args)
+    if mode == "json":
+        print(format_json(document=out))
+    elif mode == "verbose":
+        print(json.dumps(out, indent=2))
+    else:
+        print(json.dumps(out, separators=(",", ":")))
+
+    from gdoc.state import update_state_after_command
+
+    update_state_after_command(
+        doc_id, change_info, command="structure", quiet=quiet,
+    )
     return 0
 
 
@@ -2641,6 +3164,21 @@ def _cmd_new_from_file(args) -> int:
     # Insert images if any
     if images:
         _insert_images(new_id, images)
+
+    new_version = _apply_page_mode(args, new_id)
+    if new_version is None and images:
+        # Image inserts advanced the Drive version past the create-time value
+        # (a page-mode write already folds in a refresh); re-read it
+        # best-effort so state isn't seeded with a stale baseline that makes
+        # the next command report a spurious "doc edited" change.
+        from gdoc.api.drive import get_file_version
+
+        try:
+            new_version = get_file_version(new_id).get("version")
+        except Exception:
+            new_version = None
+    if new_version is not None:
+        version = new_version
 
     # Output
     from gdoc.format import format_json, get_output_mode
@@ -2734,6 +3272,77 @@ def _insert_images(doc_id: str, images) -> None:
                 pass
 
 
+def cmd_config(args) -> int:
+    """Handler for `gdoc config`."""
+    from gdoc.format import format_json, get_output_mode
+    from gdoc.util import get_default_page_mode, set_default_page_mode
+
+    mode = get_output_mode(args)
+    page_mode = getattr(args, "page_mode", None)
+    if page_mode:
+        set_default_page_mode(page_mode)
+        # Human confirmation to stderr; the value itself is echoed to stdout
+        # below (same as the GET path) so a script can capture what it set.
+        print(f"OK page_mode set to: {page_mode}", file=sys.stderr)
+        current = page_mode
+    else:
+        current = get_default_page_mode()
+
+    if mode == "json":
+        print(format_json(page_mode=current))
+    else:
+        # None = unset; the doc's mode is left to the create path.
+        print(f"page_mode\t{current or 'unset'}")
+    return 0
+
+
+def _apply_page_mode(args, doc_id: str) -> int | None:
+    """Set the page mode on a freshly created doc (best-effort).
+
+    Resolution order: --pageless/--paged flag, then the configured default
+    (`gdoc config --page-mode`). With no flag and no configured default the
+    doc is left exactly as the create path produced it — blank docs inherit
+    the account's page-mode default, markdown imports stay paged — and no API
+    call is made.
+
+    Returns the doc's post-update Drive version when a mode was actually
+    written (the write advances the version, so the caller must refresh its
+    state baseline or the next command reports a spurious "doc edited"
+    change), else None. A failure here is non-fatal — the doc already
+    exists — so it warns and returns None.
+    """
+    if getattr(args, "pageless", False):
+        pageless = True
+    elif getattr(args, "paged", False):
+        pageless = False
+    else:
+        from gdoc.util import get_default_page_mode
+
+        mode = get_default_page_mode()
+        if mode is None:
+            return None  # no explicit preference — leave the doc untouched
+        pageless = mode == "pageless"
+
+    from gdoc.api.docs import set_page_mode
+
+    try:
+        set_page_mode(doc_id, pageless)
+    except Exception as e:  # best-effort: the doc is already created
+        print(f"WARN: could not set page mode: {e}", file=sys.stderr)
+        return None
+
+    # The updateDocumentStyle write bumped the Drive version; re-read it so the
+    # caller seeds state with the post-write baseline. Best-effort: a failed
+    # refresh just falls back to the create-time version (a stale banner is
+    # better than aborting after the doc exists).
+    from gdoc.api.drive import get_file_version
+
+    try:
+        return get_file_version(doc_id).get("version")
+    except Exception:
+        return None
+
+
 def cmd_new(args) -> int:
     """Handler for `gdoc new`."""
     if getattr(args, "file_path", None):
@@ -2750,6 +3359,10 @@ def cmd_new(args) -> int:
     new_id = result["id"]
     version = result.get("version")
     url = result.get("webViewLink", "")
+
+    new_version = _apply_page_mode(args, new_id)
+    if new_version is not None:
+        version = new_version
 
     from gdoc.format import get_output_mode, format_json
 
@@ -2827,9 +3440,24 @@ def cmd_cp(args) -> int:
 def cmd_share(args) -> int:
     """Handler for `gdoc share`."""
     doc_id = _resolve_doc_id(args.doc)
-    email = args.email
+    email = getattr(args, "email", None)
+    domain = getattr(args, "domain", None)
+    anyone = getattr(args, "anyone", False)
     role = getattr(args, "role", "reader")
+    discoverable = getattr(args, "discoverable", False)
     quiet = getattr(args, "quiet", False)
+
+    targets = sum(1 for t in (email, domain, anyone) if t)
+    if targets != 1:
+        raise GdocError(
+            "provide exactly one share target: EMAIL, --domain, or --anyone",
+            exit_code=3,
+        )
+    if discoverable and email:
+        raise GdocError(
+            "--discoverable applies only to --domain/--anyone shares",
+            exit_code=3,
+        )
 
     # Pre-flight awareness check
     from gdoc.notify import pre_flight
@@ -2838,24 +3466,178 @@ def cmd_share(args) -> int:
 
     from gdoc.api.drive import create_permission
 
-    create_permission(doc_id, email, role)
+    create_permission(
+        doc_id, email=email, role=role,
+        domain=domain, anyone=anyone, discoverable=discoverable,
+    )
+
+    if email:
+        share_type, target = "user", email
+    elif domain:
+        share_type, target = "domain", domain
+    else:
+        share_type, target = "anyone", "anyone with the link"
 
     from gdoc.format import get_output_mode, format_json
 
     mode = get_output_mode(args)
     if mode == "json":
-        print(format_json(email=email, role=role, status="shared"))
+        # User shares keep the exact pre-0.16 schema; domain/anyone
+        # shares report target/type/discoverable instead.
+        if email:
+            print(format_json(email=email, role=role, status="shared"))
+        else:
+            print(format_json(
+                type=share_type, target=target, role=role,
+                status="shared", discoverable=discoverable,
+            ))
     elif mode == "plain":
-        print(f"email\t{email}")
-        print(f"role\t{role}")
+        if email:
+            print(f"email\t{email}")
+            print(f"role\t{role}")
+        else:
+            print(f"target\t{target}")
+            print(f"type\t{share_type}")
+            print(f"role\t{role}")
+            print(f"discoverable\t{'true' if discoverable else 'false'}")
     else:
-        print(f"OK shared with {email} as {role}")
+        suffix = " (discoverable)" if discoverable else ""
+        print(f"OK shared with {target} as {role}{suffix}")
 
     # Update state for the doc
     from gdoc.state import update_state_after_command
 
     update_state_after_command(doc_id, change_info, command="share", quiet=quiet)
 
+    return 0
+
+
+def cmd_mkdir(args) -> int:
+    """Handler for `gdoc mkdir`: create a Drive folder."""
+    parent_id = None
+    if getattr(args, "parent", None):
+        parent_id = _resolve_doc_id(args.parent)
+
+    from gdoc.api.drive import create_folder
+
+    result = create_folder(args.title, parent_id=parent_id)
+    folder_id = result["id"]
+    url = result.get("webViewLink", "")
+
+    from gdoc.format import format_json, get_output_mode
+
+    mode = get_output_mode(args)
+    if mode == "json":
+        print(format_json(
+            id=folder_id, name=result.get("name", args.title), url=url,
+        ))
+    elif mode == "plain":
+        print(f"id\t{folder_id}")
+    elif mode == "verbose":
+        print(f"Created folder: {result.get('name', args.title)}")
+        print(f"ID: {folder_id}")
+        print(f"URL: {url}")
+    else:
+        print(folder_id)
+    return 0
+
+
+def cmd_mv(args) -> int:
+    """Handler for `gdoc mv`: move a file into a folder."""
+    doc_id = _resolve_doc_id(args.doc)
+    folder_id = _resolve_doc_id(args.folder)
+    quiet = getattr(args, "quiet", False)
+
+    from gdoc.notify import pre_flight
+
+    change_info = pre_flight(doc_id, quiet=quiet)
+
+    from gdoc.api.drive import move_file
+
+    result = move_file(doc_id, folder_id)
+    parents = result.get("parents", [])
+
+    from gdoc.format import format_json, get_output_mode
+
+    mode = get_output_mode(args)
+    if mode == "json":
+        print(format_json(
+            id=doc_id, name=result.get("name", ""), parents=parents,
+        ))
+    elif mode == "plain":
+        print(f"id\t{doc_id}")
+        print(f"parents\t{','.join(parents)}")
+    elif mode == "verbose":
+        print(f"Moved: {result.get('name', doc_id)}")
+        print(f"To: {','.join(parents)}")
+    else:
+        print(f"OK moved to {','.join(parents) or folder_id}")
+
+    from gdoc.state import update_state_after_command
+
+    update_state_after_command(
+        doc_id, change_info, command="mv",
+        quiet=quiet, command_version=result.get("version"),
+        metadata_only_write=True,
+    )
+    return 0
+
+
+def cmd_rename(args) -> int:
+    """Handler for `gdoc rename`: retitle a file."""
+    doc_id = _resolve_doc_id(args.doc)
+    quiet = getattr(args, "quiet", False)
+
+    from gdoc.notify import pre_flight
+
+    change_info = pre_flight(doc_id, quiet=quiet)
+
+    from gdoc.api.drive import rename_file
+
+    result = rename_file(doc_id, args.title)
+    name = result.get("name", args.title)
+
+    from gdoc.format import format_json, get_output_mode
+
+    mode = get_output_mode(args)
+    if mode == "json":
+        print(format_json(id=doc_id, name=name))
+    elif mode == "plain":
+        print(f"id\t{doc_id}")
+        print(f"name\t{name}")
+    elif mode == "verbose":
+        print(f"Renamed: {doc_id}")
+        print(f"Name: {name}")
+    else:
+        print(f"OK renamed to {name}")
+
+    from gdoc.state import update_state_after_command
+
+    update_state_after_command(
+        doc_id, change_info, command="rename",
+        quiet=quiet, command_version=result.get("version"),
+        metadata_only_write=True,
+    )
+    return 0
+
+
+def cmd_drives(args) -> int:
+    """Handler for `gdoc drives`: list shared drives."""
+    from gdoc.api.drive import list_shared_drives
+    from gdoc.format import format_json, get_output_mode
+
+    drives = list_shared_drives()
+    mode = get_output_mode(args)
+    if mode == "json":
+        print(format_json(drives=drives))
+    elif mode == "plain":
+        for d in drives:
+            print(f"{d.get('id', '')}\t{d.get('name', '')}")
+    elif not drives:
+        print("No shared drives.")
+    else:
+        for d in drives:
+            print(f"{d.get('id', '')}  {d.get('name', '')}")
     return 0
 
 
@@ -2959,6 +3741,19 @@ def build_parser() -> GdocArgumentParser:
     )
     auth_p.set_defaults(func=cmd_auth)
 
+    # config
+    config_p = sub.add_parser(
+        "config", parents=[output_parent],
+        help="Get or set gdoc configuration (applies to all accounts)",
+    )
+    config_p.add_argument(
+        "--page-mode", choices=["pageless", "paged"],
+        help="Default page mode for docs created by `gdoc new` "
+        "(unset = inherit the account default; markdown imports stay paged; "
+        "applies to all accounts)",
+    )
+    config_p.set_defaults(func=cmd_config)
+
     # ls
     ls_p = sub.add_parser("ls", parents=[output_parent], help="List files in Drive")
     ls_p.add_argument("folder_id", nargs="?", help="Folder ID to list")
@@ -2974,6 +3769,13 @@ def build_parser() -> GdocArgumentParser:
     find_p = sub.add_parser("find", parents=[output_parent], help="Search files by name/content")
     find_p.add_argument("query", help="Search query")
     find_p.add_argument("--title", action="store_true", help="Search title only")
+    find_p.add_argument(
+        "--raw", action="store_true",
+        help="Treat QUERY as a raw Drive query, e.g. "
+        "\"mimeType='application/vnd.google-apps.document' and "
+        "'me' in owners\" (searches all drives, including shared "
+        "drives you're a member of)",
+    )
     find_p.set_defaults(func=cmd_find)
 
     # cat
@@ -3350,7 +4152,12 @@ def build_parser() -> GdocArgumentParser:
     comment_p.add_argument("doc", help="Document ID or URL")
     comment_p.add_argument("text", help="Comment text")
     comment_p.add_argument(
-        "--quote", help="Quoted text the comment refers to",
+        "--quote",
+        help=(
+            "Text to anchor the comment to. Creates a real anchored "
+            "comment (Docs API preview) when available; otherwise "
+            "stored as quote metadata for cat --comments"
+        ),
     )
     comment_p.add_argument(
         "--quiet", action="store_true", help="Skip pre-flight checks"
@@ -3430,6 +4237,130 @@ def build_parser() -> GdocArgumentParser:
     )
     images_p.set_defaults(func=cmd_images)
 
+    # export
+    export_p = sub.add_parser(
+        "export", parents=[output_parent],
+        help="Export a doc to PDF, DOCX, HTML, and more",
+        description=(
+            "Render a document to a file via Drive export. Exports cover "
+            "the whole document (all tabs). Binary formats (pdf, docx, "
+            "odt, epub) require --out; text formats print to stdout "
+            "without it."
+        ),
+    )
+    export_p.add_argument("doc", help="Document ID or URL")
+    export_p.add_argument(
+        "--format", choices=sorted(_EXPORT_MIME),
+        help="Export format (default: inferred from --out extension)",
+    )
+    export_p.add_argument(
+        "--out", metavar="FILE", help="Output file path",
+    )
+    export_p.add_argument(
+        "--quiet", action="store_true", help="Skip pre-flight checks"
+    )
+    export_p.set_defaults(func=cmd_export)
+
+    # insert-image
+    ii_p = sub.add_parser(
+        "insert-image", parents=[output_parent],
+        help="Insert an image into an existing doc",
+        description=(
+            "Insert a local image file or a public image URL into a doc. "
+            "Local files are uploaded to Drive as a temporary public-read "
+            "file and deleted after the insert."
+        ),
+    )
+    ii_p.add_argument("doc", help="Document ID or URL")
+    ii_p.add_argument("image", help="Local image path or public image URL")
+    ii_p.add_argument(
+        "--tab", help="Tab title or ID (required for multi-tab docs)",
+    )
+    ii_where = ii_p.add_mutually_exclusive_group(required=True)
+    ii_where.add_argument(
+        "--after", metavar="TEXT",
+        help="Insert immediately after this anchor text",
+    )
+    ii_where.add_argument(
+        "--index", type=int, metavar="N",
+        help="Insert at a raw UTF-16 document index (advanced)",
+    )
+    ii_where.add_argument(
+        "--end", action="store_true", help="Append at the end of the tab",
+    )
+    ii_p.add_argument(
+        "--width", type=float, metavar="PT", help="Display width in points",
+    )
+    ii_p.add_argument(
+        "--height", type=float, metavar="PT",
+        help="Display height in points",
+    )
+    ii_p.add_argument(
+        "--quiet", action="store_true", help="Skip pre-flight checks"
+    )
+    ii_p.set_defaults(func=cmd_insert_image)
+
+    # replace-image
+    ri_p = sub.add_parser(
+        "replace-image", parents=[output_parent],
+        help="Replace an existing image's content by object ID",
+        description=(
+            "Swap the content of an image in place (object IDs come from "
+            "`gdoc images`). The image keeps its current size; the new "
+            "content is scaled and center-cropped to fit."
+        ),
+    )
+    ri_p.add_argument("doc", help="Document ID or URL")
+    ri_p.add_argument("object_id", help="Image object ID (see `gdoc images`)")
+    ri_p.add_argument("image", help="Local image path or public image URL")
+    ri_p.add_argument(
+        "--quiet", action="store_true", help="Skip pre-flight checks"
+    )
+    ri_p.set_defaults(func=cmd_replace_image)
+
+    # structure
+    structure_p = sub.add_parser(
+        "structure", parents=[output_parent],
+        help="Native document JSON (structure, styles, UTF-16 ranges)",
+        description=(
+            "Dump the raw documents.get response — tab topology, "
+            "paragraph/text styles, tables, inline objects, named "
+            "ranges, headers/footers, and the UTF-16 startIndex/"
+            "endIndex values native mutations need (Docs indices are "
+            "UTF-16 code units, not Python character offsets; a smart "
+            "chip occupies one code unit). Output is always JSON: "
+            "compact by default, indented with --verbose, wrapped in "
+            "the standard envelope with --json. Read-only."
+        ),
+    )
+    structure_p.add_argument("doc", help="Document ID or URL")
+    structure_p.add_argument(
+        "--tab",
+        help="Narrow to one tab by title or ID (returns that tab's raw "
+        "subtree plus documentId/revisionId)",
+    )
+    structure_p.add_argument(
+        "--fields",
+        help="Docs API field mask passed verbatim, e.g. "
+        "'revisionId,tabs(tabProperties)' (Google rejects masks that "
+        "recursively expand childTabs)",
+    )
+    structure_p.add_argument(
+        "--suggestions-view-mode",
+        choices=[
+            "default_for_current_access",
+            "suggestions_inline",
+            "preview_suggestions_accepted",
+            "preview_without_suggestions",
+        ],
+        help="How suggestions are rendered; changes returned content "
+        "and indexes (the used mode is echoed in the output)",
+    )
+    structure_p.add_argument(
+        "--quiet", action="store_true", help="Skip pre-flight checks"
+    )
+    structure_p.set_defaults(func=cmd_structure)
+
     # info
     info_p = sub.add_parser("info", parents=[output_parent], help="Show document metadata")
     info_p.add_argument("doc", help="Document ID or URL")
@@ -3441,7 +4372,19 @@ def build_parser() -> GdocArgumentParser:
     # share
     share_p = sub.add_parser("share", parents=[output_parent], help="Share a document")
     share_p.add_argument("doc", help="Document ID or URL")
-    share_p.add_argument("email", help="Email to share with")
+    share_p.add_argument(
+        "email", nargs="?",
+        help="Email to share with (or use --domain / --anyone)",
+    )
+    share_target = share_p.add_mutually_exclusive_group()
+    share_target.add_argument(
+        "--domain", metavar="DOMAIN",
+        help="Share with everyone in a Workspace domain (link-based)",
+    )
+    share_target.add_argument(
+        "--anyone", action="store_true",
+        help="Share with anyone who has the link",
+    )
     share_p.add_argument(
         "--role",
         choices=["reader", "writer", "commenter"],
@@ -3449,9 +4392,54 @@ def build_parser() -> GdocArgumentParser:
         help="Permission role",
     )
     share_p.add_argument(
+        "--discoverable", action="store_true",
+        help="Let the file appear in search results "
+        "(--domain/--anyone only; off by default)",
+    )
+    share_p.add_argument(
         "--quiet", action="store_true", help="Skip pre-flight checks"
     )
     share_p.set_defaults(func=cmd_share)
+
+    # mkdir
+    mkdir_p = sub.add_parser(
+        "mkdir", parents=[output_parent], help="Create a Drive folder",
+    )
+    mkdir_p.add_argument("title", help="Folder name")
+    mkdir_p.add_argument(
+        "--parent", metavar="FOLDER",
+        help="Parent folder ID or URL (default: My Drive root)",
+    )
+    mkdir_p.set_defaults(func=cmd_mkdir)
+
+    # mv
+    mv_p = sub.add_parser(
+        "mv", parents=[output_parent], aliases=["move"],
+        help="Move a file into a folder",
+    )
+    mv_p.add_argument("doc", help="File ID or URL")
+    mv_p.add_argument("folder", help="Destination folder ID or URL")
+    mv_p.add_argument(
+        "--quiet", action="store_true", help="Skip pre-flight checks"
+    )
+    mv_p.set_defaults(func=cmd_mv)
+
+    # rename
+    rename_p = sub.add_parser(
+        "rename", parents=[output_parent], help="Rename a file",
+    )
+    rename_p.add_argument("doc", help="File ID or URL")
+    rename_p.add_argument("title", help="New title")
+    rename_p.add_argument(
+        "--quiet", action="store_true", help="Skip pre-flight checks"
+    )
+    rename_p.set_defaults(func=cmd_rename)
+
+    # drives
+    drives_p = sub.add_parser(
+        "drives", parents=[output_parent], help="List shared drives",
+    )
+    drives_p.set_defaults(func=cmd_drives)
 
     # new
     new_p = sub.add_parser("new", parents=[output_parent], help="Create a blank document")
@@ -3460,6 +4448,15 @@ def build_parser() -> GdocArgumentParser:
     new_p.add_argument(
         "--file", dest="file_path",
         help="Create doc from a local markdown file",
+    )
+    new_mode = new_p.add_mutually_exclusive_group()
+    new_mode.add_argument(
+        "--pageless", action="store_true",
+        help="Create pageless (overrides the configured default)",
+    )
+    new_mode.add_argument(
+        "--paged", action="store_true",
+        help="Create paged (overrides the configured default)",
     )
     new_p.set_defaults(func=cmd_new)
 

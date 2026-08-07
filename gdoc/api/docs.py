@@ -6,7 +6,12 @@ from functools import lru_cache
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from gdoc.util import AuthError, GdocError, fold_typography
+from gdoc.util import (
+    AuthError,
+    GdocError,
+    PreviewUnavailableError,
+    fold_typography,
+)
 
 
 @lru_cache(maxsize=1)
@@ -78,6 +83,129 @@ def replace_all_text(
         _translate_http_error(e, doc_id)
 
 
+def insert_comment(
+    doc_id: str,
+    content: str,
+    start_index: int,
+    end_index: int,
+    tab_id: str | None = None,
+    revision_id: str = "",
+) -> str:
+    """Insert a comment anchored to a text range (Docs API insertComment).
+
+    Unlike Drive's quotedFileContent (display metadata only), this creates a
+    real anchored comment — highlighted in the Docs UI like one created by
+    hand. The request is a Workspace Developer Preview feature: projects not
+    enrolled get a 400 for the unknown request type, and comment-only access
+    can't batchUpdate at all (403) but can still comment via the Drive API.
+    Both are raised as PreviewUnavailableError so callers can fall back to
+    the Drive path — as is a revision mismatch when *revision_id* is given
+    (the doc changed under us, so the range may no longer be right).
+
+    Args:
+        doc_id: The document ID.
+        content: Comment text, plain text (max 2048 UTF-8 code units).
+        start_index: Range start (from find_text_in_document).
+        end_index: Range end, exclusive.
+        tab_id: Tab the range lives in (omitted → first tab).
+        revision_id: If non-empty, sent as writeControl.requiredRevisionId
+            so the anchor can't land on stale coordinates.
+
+    Returns:
+        The new comment thread ID (same ID space as Drive API comments).
+    """
+    range_: dict = {"startIndex": start_index, "endIndex": end_index}
+    if tab_id:
+        range_["tabId"] = tab_id
+    body: dict = {
+        "requests": [
+            {"insertComment": {"content": content, "range": range_}}
+        ]
+    }
+    if revision_id:
+        body["writeControl"] = {"requiredRevisionId": revision_id}
+    try:
+        service = get_docs_service()
+        result = (
+            service.documents()
+            .batchUpdate(documentId=doc_id, body=body)
+            .execute()
+        )
+    except HttpError as e:
+        status = int(e.resp.status)
+        detail = str(e)
+        # A non-enrolled project sees insertComment as an unknown field:
+        # either rejected by name ("Unknown name"/"Cannot find field") or
+        # silently dropped, leaving an empty request union ("No request
+        # set" — the observed live behavior). We always set insertComment,
+        # so an empty union can only mean the server didn't recognize it.
+        # A revision mismatch means the doc changed between our read and
+        # this write; the caller's unanchored fallback is still correct.
+        if status == 400 and (
+            "Unknown name" in detail
+            or "Cannot find field" in detail
+            or "No request set" in detail
+            or "revision" in detail.lower()
+        ):
+            raise PreviewUnavailableError(
+                "insertComment not available or not applicable "
+                "(preview not enabled, or the document changed)"
+            )
+        if status == 403:
+            raise PreviewUnavailableError(
+                "insertComment not permitted for this user"
+            )
+        _translate_http_error(e, doc_id)
+
+    # Comment saves can fail even when the batchUpdate itself returns 200.
+    state = result.get("commentUpdateState", "")
+    if state and state != "ALL_SAVED":
+        raise PreviewUnavailableError(f"comment not saved ({state})")
+    replies = result.get("replies", [])
+    thread = (replies[0] if replies else {}).get(
+        "insertComment", {},
+    ).get("commentThread", {})
+    comment_id = thread.get("commentId", "")
+    if not comment_id:
+        raise PreviewUnavailableError(
+            "no comment thread in insertComment response"
+        )
+    return comment_id
+
+
+def set_page_mode(doc_id: str, pageless: bool) -> None:
+    """Set a document's page mode (pageless vs paged).
+
+    Writes ``documentStyle.documentFormat.documentMode`` via updateDocumentStyle.
+    Blank docs inherit the account's page-mode default, while markdown-imported
+    docs are always created paged; this makes the mode explicit either way.
+
+    Args:
+        doc_id: The document ID.
+        pageless: If True, set PAGELESS; otherwise PAGES (paged).
+    """
+    mode = "PAGELESS" if pageless else "PAGES"
+    try:
+        service = get_docs_service()
+        service.documents().batchUpdate(
+            documentId=doc_id,
+            body={
+                "requests": [
+                    {
+                        "updateDocumentStyle": {
+                            "documentStyle": {
+                                "documentFormat": {"documentMode": mode},
+                            },
+                            "fields": "documentFormat.documentMode",
+                        }
+                    }
+                ]
+            },
+        ).execute()
+    except HttpError as e:
+        _translate_http_error(e, doc_id)
+
+
 def _extract_paragraphs_text(content: list[dict]) -> str:
     """Extract concatenated text from body content paragraph elements."""
     parts = []
@@ -105,6 +233,9 @@ def flatten_tabs(tabs: list[dict], _level: int = 0) -> list[dict]:
             "index": props.get("index", 0),
             "nesting_level": _level,
             "body": doc_tab.get("body", {}),
+            # listId -> list definition; needed to tell ordered from bullet
+            # lists when rendering a tab as markdown.
+            "lists": doc_tab.get("lists", {}),
         })
         for child in tab.get("childTabs", []):
             result.extend(flatten_tabs([child], _level=_level + 1))
@@ -135,18 +266,139 @@ def count_document_tabs(doc_id: str) -> int:
     return len(flatten_tabs(doc.get("tabs", [])))
 
 
-def get_tab_text(tab: dict) -> str:
-    """Extract plain text from a tab's body content.
+def _list_is_ordered(lists: dict, list_id: str, level: int) -> bool:
+    """Whether a list level is ordered (numbered) rather than a bullet.
 
-    Handles paragraphs and tables (tab-joined cells per row).
+    A Docs list level carries a ``glyphType`` (DECIMAL/ALPHA/ROMAN/...) when
+    ordered and a ``glyphSymbol`` (a bullet character) when not.
+    """
+    levels = (
+        lists.get(list_id, {})
+        .get("listProperties", {})
+        .get("nestingLevels", [])
+    )
+    if 0 <= level < len(levels):
+        glyph_type = levels[level].get("glyphType", "")
+        return bool(glyph_type) and glyph_type != "GLYPH_TYPE_UNSPECIFIED"
+    return False
+
+
+def _style_run_markdown(content: str, style: dict) -> str:
+    """Wrap one text run's content in markdown emphasis / link syntax.
+
+    Surrounding spaces and the trailing paragraph newline are kept outside
+    the markers (``** bold **`` is not valid markdown), so only the visible
+    core is wrapped. Emphasis nests as ``***bold italic***`` and
+    ``~~struck~~``; a link becomes ``[text](url)``.
+    """
+    newline = ""
+    text = content
+    if text.endswith("\n"):
+        text, newline = text[:-1], "\n"
+    if not text.strip():
+        return content
+    lead = text[: len(text) - len(text.lstrip(" "))]
+    trail = text[len(text.rstrip(" ")):]
+    core = text.strip(" ")
+
+    link = (style.get("link") or {}).get("url")
+    if link:
+        core = f"[{core}]({link})"
+    else:
+        if style.get("bold") and style.get("italic"):
+            core = f"***{core}***"
+        elif style.get("bold"):
+            core = f"**{core}**"
+        elif style.get("italic"):
+            core = f"*{core}*"
+        if style.get("strikethrough"):
+            core = f"~~{core}~~"
+    return f"{lead}{core}{trail}{newline}"
+
+
+def _runs_markdown(elements: list[dict]) -> str:
+    """Join a paragraph's text runs, styling each as markdown."""
+    parts = []
+    for pe in elements:
+        text_run = pe.get("textRun")
+        if text_run is None:
+            continue
+        content = text_run.get("content", "")
+        if content:
+            parts.append(
+                _style_run_markdown(content, text_run.get("textStyle", {}))
+            )
+    return "".join(parts)
+
+
+def _paragraph_markdown(
+    paragraph: dict, lists: dict, ordered_counters: dict
+) -> str:
+    """Render one paragraph as markdown: headings, list items, inline styles.
+
+    ``ordered_counters`` (nesting level -> running ordinal) is carried across
+    paragraphs by the caller so numbered lists count 1, 2, 3.
+    """
+    text = _runs_markdown(paragraph.get("elements", []))
+    newline = ""
+    if text.endswith("\n"):
+        text, newline = text[:-1], "\n"
+
+    bullet = paragraph.get("bullet")
+    if bullet is not None and text.strip():
+        level = bullet.get("nestingLevel", 0)
+        # A shallower item ends any deeper numbering.
+        for deeper in [lvl for lvl in ordered_counters if lvl > level]:
+            del ordered_counters[deeper]
+        indent = "  " * level  # 2 columns per level (matches the md parser)
+        if _list_is_ordered(lists, bullet.get("listId", ""), level):
+            ordered_counters[level] = ordered_counters.get(level, 0) + 1
+            marker = f"{ordered_counters[level]}."
+        else:
+            ordered_counters.pop(level, None)
+            marker = "-"
+        item = text.lstrip(" \t")
+        return f"{indent}{marker} {item}{newline}"
+
+    # Not a list item: numbering restarts at the next list.
+    ordered_counters.clear()
+
+    named_style = paragraph.get("paragraphStyle", {}).get("namedStyleType", "")
+    level = _HEADING_LEVELS.get(named_style)
+    if level and text.strip():
+        # lstrip leading spaces/tabs so the "# " prefix can't stack a
+        # widening gap across read->write round-trips.
+        return "#" * level + " " + text.lstrip(" \t") + newline
+    return text + newline
+
+
+def get_tab_text(tab: dict, markdown: bool = False) -> str:
+    """Extract text from a tab's body content.
+
+    Handles paragraphs and tables (tab-joined cells per row). When
+    *markdown* is True, the per-tab export (which builds markdown by hand,
+    unlike the whole-doc Drive export) renders headings (``#``), bullet and
+    numbered lists (nested, 2 spaces per level), and inline emphasis
+    (``**bold**``, ``*italic*``, ``~~strike~~``) and ``[links](url)``, so a
+    tab round-trips through ``insert``/``edit`` without losing structure.
+    With *markdown* False (the ``--plain`` path) text is returned verbatim
+    -- the matchable form ``gdoc edit`` searches against.
     """
     body = tab.get("body", {})
     content = body.get("content", [])
+    lists = tab.get("lists", {}) if markdown else {}
     parts = []
+    ordered_counters: dict = {}
     for element in content:
         if "paragraph" in element:
-            parts.append(_extract_paragraphs_text([element]))
+            if not markdown:
+                parts.append(_extract_paragraphs_text([element]))
+                continue
+            parts.append(
+                _paragraph_markdown(element["paragraph"], lists, ordered_counters)
+            )
         elif "table" in element:
+            ordered_counters.clear()
             table = element["table"]
             for row in table.get("tableRows", []):
                 cells = []
@@ -192,6 +444,11 @@ def get_document(doc_id: str) -> dict:
         _translate_http_error(e, doc_id)
 
 
+def _utf16_len(ch: str) -> int:
+    """Width of one code point in UTF-16 code units (Docs API indices)."""
+    return 2 if ord(ch) > 0xFFFF else 1
+
+
 def _collect_segments(content: list[dict]) -> list[list[tuple[int, str]]]:
     """Group (doc_index, char) pairs into independently-searchable segments.
 
@@ -200,6 +457,9 @@ def _collect_segments(content: list[dict]) -> list[list[tuple[int, str]]]:
     means a match can never span a table-cell boundary \u2014 the Docs API can't
     delete a range that crosses cells or removes a cell's final paragraph
     mark, so such a match would produce an invalid edit.
+
+    Doc indices are UTF-16 code units, so a non-BMP character (emoji)
+    advances the index by 2 even though it's one Python char.
     """
     segments: list[list[tuple[int, str]]] = []
     root: list[tuple[int, str]] = []
@@ -212,8 +472,10 @@ def _collect_segments(content: list[dict]) -> list[list[tuple[int, str]]]:
                     continue
                 run = text_run.get("content", "")
                 start_idx = pe.get("startIndex", 0)
-                for i, ch in enumerate(run):
-                    root.append((start_idx + i, ch))
+                offset = 0
+                for ch in run:
+                    root.append((start_idx + offset, ch))
+                    offset += _utf16_len(ch)
             continue
         table = element.get("table")
         if table is not None:
@@ -278,7 +540,8 @@ def find_text_in_document(
             end_pos = pos + len(search_text)
             matches.append({
                 "startIndex": doc_indices[pos],
-                "endIndex": doc_indices[end_pos - 1] + 1,
+                "endIndex": doc_indices[end_pos - 1]
+                + _utf16_len(chars[end_pos - 1][1]),
             })
             start = pos + 1
 
@@ -615,27 +878,13 @@ def _insert_table(
         _translate_http_error(e, doc_id)
 
 
-def list_inline_objects(doc_id: str) -> list[dict]:
-    """List all inline and positioned objects in a document.
+def _collect_object_refs(body: dict) -> list[tuple[str, int, str]]:
+    """Walk body.content for object references.
 
-    Walks body.content for inlineObjectElement and positionedObjectId
-    references, joins with document.inlineObjects and positionedObjects
-    maps, and classifies each object.
-
-    Returns list of dicts with id, type, title, description, dimensions,
-    content_uri, source_uri, start_index, and chart metadata.
+    Returns (object_id, start_index, source) tuples, where source is
+    "inline" or "positioned".
     """
-    try:
-        doc = get_document(doc_id)
-    except GdocError:
-        raise
-
-    inline_map = doc.get("inlineObjects", {})
-    positioned_map = doc.get("positionedObjects", {})
-
-    # Walk body.content to find references and their startIndex
-    refs: list[tuple[str, int, str]] = []  # (object_id, start_index, source)
-    body = doc.get("body", {})
+    refs: list[tuple[str, int, str]] = []
     for element in body.get("content", []):
         paragraph = element.get("paragraph")
         if paragraph is None:
@@ -651,68 +900,114 @@ def list_inline_objects(doc_id: str) -> list[dict]:
         para_start = element.get("startIndex", 0)
         for pid in positioned_ids:
             refs.append((pid, para_start, "positioned"))
+    return refs
+
+
+def list_inline_objects(doc_id: str) -> list[dict]:
+    """List all inline and positioned objects in a document, every tab.
+
+    Walks each tab's body.content for inlineObjectElement and
+    positionedObjectId references, joins with the tab's inlineObjects
+    and positionedObjects maps, and classifies each object.
+
+    Returns list of dicts with id, tab, type, title, description,
+    dimensions, content_uri, source_uri, start_index, and chart
+    metadata. `tab` is "" for documents fetched without tab content.
+    """
+    doc = get_document_with_tabs(doc_id)
+
+    # (tab_id, body, inline_map, positioned_map) per content segment
+    segments: list[tuple[str, dict, dict, dict]] = []
+    tabs = doc.get("tabs")
+    if tabs:
+        def walk(ts: list[dict]):
+            for t in ts:
+                doc_tab = t.get("documentTab", {})
+                yield (
+                    t.get("tabProperties", {}).get("tabId", ""),
+                    doc_tab.get("body", {}),
+                    doc_tab.get("inlineObjects", {}),
+                    doc_tab.get("positionedObjects", {}),
+                )
+                yield from walk(t.get("childTabs", []))
+
+        segments = list(walk(tabs))
+    else:
+        segments = [(
+            "",
+            doc.get("body", {}),
+            doc.get("inlineObjects", {}),
+            doc.get("positionedObjects", {}),
+        )]
 
     results = []
     seen = set()
 
-    for obj_id, start_index, source in refs:
-        if obj_id in seen:
-            continue
-        seen.add(obj_id)
+    for tab_id, body, inline_map, positioned_map in segments:
+        for obj_id, start_index, source in _collect_object_refs(body):
+            if (tab_id, obj_id) in seen:
+                continue
+            seen.add((tab_id, obj_id))
 
-        if source == "inline":
-            obj_data = inline_map.get(obj_id, {})
-        else:
-            obj_data = positioned_map.get(obj_id, {})
-
-        props = obj_data.get("inlineObjectProperties", {}) or obj_data.get(
-            "positionedObjectProperties", {}
-        )
-        embedded = props.get("embeddedObject", {})
-
-        # Classify type
-        obj_type = "image"
-        spreadsheet_id = None
-        chart_id = None
-        if "embeddedDrawingProperties" in embedded:
-            obj_type = "drawing"
-        elif "linkedContentReference" in embedded:
-            lcr = embedded["linkedContentReference"]
-            if "sheetsChartReference" in lcr:
-                obj_type = "chart"
-                scr = lcr["sheetsChartReference"]
-                spreadsheet_id = scr.get("spreadsheetId")
-                chart_id = scr.get("chartId")
-
-        # Extract dimensions
-        size = embedded.get("size", {})
-        width = size.get("width", {}).get("magnitude", 0)
-        height = size.get("height", {}).get("magnitude", 0)
-
-        # Content URI (None for drawings)
-        content_uri = None
-        if obj_type != "drawing":
-            image_props = embedded.get("imageProperties", {})
-            content_uri = image_props.get("contentUri")
-
-        entry = {
-            "id": obj_id,
-            "type": obj_type,
-            "title": embedded.get("title", ""),
-            "description": embedded.get("description", ""),
-            "width_pt": width,
-            "height_pt": height,
-            "content_uri": content_uri,
-            "source_uri": embedded.get("imageProperties", {}).get("sourceUri"),
-            "start_index": start_index,
-        }
-        if obj_type == "chart":
-            entry["spreadsheet_id"] = spreadsheet_id
-            entry["chart_id"] = chart_id
-
-        results.append(entry)
+            if source == "inline":
+                obj_data = inline_map.get(obj_id, {})
+            else:
+                obj_data = positioned_map.get(obj_id, {})
+            results.append(_classify_object(obj_id, obj_data, start_index, tab_id))
 
     return results
+
+
+def _classify_object(
+    obj_id: str, obj_data: dict, start_index: int, tab_id: str,
+) -> dict:
+    """Build the metadata entry for one inline/positioned object."""
+    props = obj_data.get("inlineObjectProperties", {}) or obj_data.get(
+        "positionedObjectProperties", {}
+    )
+    embedded = props.get("embeddedObject", {})
+
+    # Classify type
+    obj_type = "image"
+    spreadsheet_id = None
+    chart_id = None
+    if "embeddedDrawingProperties" in embedded:
+        obj_type = "drawing"
+    elif "linkedContentReference" in embedded:
+        lcr = embedded["linkedContentReference"]
+        if "sheetsChartReference" in lcr:
+            obj_type = "chart"
+            scr = lcr["sheetsChartReference"]
+            spreadsheet_id = scr.get("spreadsheetId")
+            chart_id = scr.get("chartId")
+
+    # Extract dimensions
+    size = embedded.get("size", {})
+    width = size.get("width", {}).get("magnitude", 0)
+    height = size.get("height", {}).get("magnitude", 0)
+
+    # Content URI (None for drawings)
+    content_uri = None
+    if obj_type != "drawing":
+        image_props = embedded.get("imageProperties", {})
+        content_uri = image_props.get("contentUri")
+
+    entry = {
+        "id": obj_id,
+        "tab": tab_id,
+        "type": obj_type,
+        "title": embedded.get("title", ""),
+        "description": embedded.get("description", ""),
+        "width_pt": width,
+        "height_pt": height,
+        "content_uri": content_uri,
+        "source_uri": embedded.get("imageProperties", {}).get("sourceUri"),
+        "start_index": start_index,
+    }
+    if obj_type == "chart":
+        entry["spreadsheet_id"] = spreadsheet_id
+        entry["chart_id"] = chart_id
+    return entry
 
 
 def download_image(content_uri: str, dest_path: str) -> None:
@@ -723,6 +1018,130 @@ def download_image(content_uri: str, dest_path: str) -> None:
         data = resp.read()
     with open(dest_path, "wb") as f:
         f.write(data)
+
+
+def insert_inline_image(
+    doc_id: str,
+    uri: str,
+    index: int,
+    tab_id: str | None = None,
+    revision_id: str = "",
+    width_pt: float | None = None,
+    height_pt: float | None = None,
+) -> str:
+    """Insert an inline image at a document index via insertInlineImage.
+
+    Args:
+        doc_id: The document ID.
+        uri: Publicly fetchable image URL (Google's servers download it).
+        index: UTF-16 insertion index (from find_text_in_document).
+        tab_id: Tab the index lives in (omitted → first tab).
+        revision_id: If non-empty, sent as writeControl.requiredRevisionId
+            so the insert can't land on stale coordinates.
+        width_pt: Optional display width in points.
+        height_pt: Optional display height in points.
+
+    Returns:
+        The new inline object ID (usable with `gdoc images`/replace_image).
+    """
+    location: dict = {"index": index}
+    if tab_id:
+        location["tabId"] = tab_id
+    request: dict = {"location": location, "uri": uri}
+    size: dict = {}
+    if width_pt:
+        size["width"] = {"magnitude": width_pt, "unit": "PT"}
+    if height_pt:
+        size["height"] = {"magnitude": height_pt, "unit": "PT"}
+    if size:
+        request["objectSize"] = size
+    body: dict = {"requests": [{"insertInlineImage": request}]}
+    if revision_id:
+        body["writeControl"] = {"requiredRevisionId": revision_id}
+    try:
+        service = get_docs_service()
+        result = (
+            service.documents()
+            .batchUpdate(documentId=doc_id, body=body)
+            .execute()
+        )
+    except HttpError as e:
+        _raise_if_stale_revision(e)
+        _translate_http_error(e, doc_id)
+    replies = result.get("replies", [])
+    return (replies[0] if replies else {}).get(
+        "insertInlineImage", {},
+    ).get("objectId", "")
+
+
+def replace_image(
+    doc_id: str,
+    object_id: str,
+    uri: str,
+    tab_id: str | None = None,
+    revision_id: str = "",
+) -> None:
+    """Replace an existing image's content via replaceImage.
+
+    The existing image keeps its size; the new content is scaled and
+    center-cropped to fit (CENTER_CROP is the only supported method).
+
+    Args:
+        doc_id: The document ID.
+        object_id: Inline object ID of the image (see `gdoc images`).
+        uri: Publicly fetchable replacement image URL.
+        tab_id: Tab the image lives in (omitted → first tab).
+        revision_id: If non-empty, sent as writeControl.requiredRevisionId.
+    """
+    request: dict = {
+        "imageObjectId": object_id,
+        "uri": uri,
+        "imageReplaceMethod": "CENTER_CROP",
+    }
+    if tab_id:
+        request["tabId"] = tab_id
+    body: dict = {"requests": [{"replaceImage": request}]}
+    if revision_id:
+        body["writeControl"] = {"requiredRevisionId": revision_id}
+    try:
+        service = get_docs_service()
+        service.documents().batchUpdate(
+            documentId=doc_id, body=body,
+        ).execute()
+    except HttpError as e:
+        _raise_if_stale_revision(e)
+        _translate_http_error(e, doc_id)
+
+
+def _raise_if_stale_revision(e: HttpError) -> None:
+    """Turn a writeControl revision-mismatch 400 into a clear retry hint."""
+    if int(e.resp.status) == 400 and "revision" in str(e).lower():
+        raise GdocError(
+            "document changed while the command was running; re-run it"
+        )
+
+
+def find_object_tab(doc: dict, object_id: str) -> str | None:
+    """Find which tab holds an inline/positioned object ID.
+
+    Walks the tab tree of a documents.get(includeTabsContent=True) response.
+    Returns the tab ID, or None if no tab declares the object (including
+    docs fetched without tab content).
+    """
+    def walk(tabs: list[dict]) -> str | None:
+        for tab in tabs:
+            doc_tab = tab.get("documentTab", {})
+            if (
+                object_id in doc_tab.get("inlineObjects", {})
+                or object_id in doc_tab.get("positionedObjects", {})
+            ):
+                return tab.get("tabProperties", {}).get("tabId")
+            found = walk(tab.get("childTabs", []))
+            if found is not None:
+                return found
+        return None
+
+    return walk(doc.get("tabs", []))
 
 
 _HEADING_LEVELS = {
@@ -783,6 +1202,59 @@ def get_document_with_tabs(doc_id: str) -> dict:
         )
     except HttpError as e:
         _translate_http_error(e, doc_id)
+
+
+def get_document_structure(
+    doc_id: str,
+    fields: str | None = None,
+    suggestions_view_mode: str | None = None,
+) -> dict:
+    """Fetch the raw documents.get JSON for native structure inspection.
+
+    Always requests includeTabsContent=True so every tab's body is
+    present. A fields mask is passed verbatim when given — note Google
+    rejects masks that recursively expand childTabs (repo issue #14).
+
+    Args:
+        doc_id: The document ID.
+        fields: Optional Docs API field mask.
+        suggestions_view_mode: Optional SuggestionsViewMode enum value
+            (e.g. PREVIEW_SUGGESTIONS_ACCEPTED). Changes returned content
+            and indexes.
+    """
+    kwargs: dict = {"documentId": doc_id, "includeTabsContent": True}
+    if fields:
+        kwargs["fields"] = fields
+    if suggestions_view_mode:
+        kwargs["suggestionsViewMode"] = suggestions_view_mode
+    try:
+        service = get_docs_service()
+        return service.documents().get(**kwargs).execute()
+    except HttpError as e:
+        _translate_http_error(e, doc_id)
+
+
+def resolve_raw_tab(tabs: list[dict], tab_name: str) -> dict | None:
+    """Find a raw tab dict by title (case-insensitive) or tab ID.
+
+    Unlike resolve_tab (which returns a flattened summary), this returns
+    the tab's raw API dict — tabProperties, documentTab, childTabs —
+    searching the whole tree. Title matches win over ID matches,
+    mirroring resolve_tab. Returns None when nothing matches.
+    """
+    def walk(ts: list[dict]):
+        for t in ts:
+            yield t
+            yield from walk(t.get("childTabs", []))
+
+    for t in walk(tabs):
+        props = t.get("tabProperties", {})
+        if props.get("title", "").lower() == tab_name.lower():
+            return t
+    for t in walk(tabs):
+        if str(t.get("tabProperties", {}).get("tabId", "")) == tab_name:
+            return t
+    return None
 
 
 def add_tab(doc_id: str, title: str) -> dict:

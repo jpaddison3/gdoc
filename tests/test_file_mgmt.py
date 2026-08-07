@@ -11,6 +11,14 @@ from gdoc.notify import ChangeInfo
 from gdoc.util import AuthError, GdocError
 
 
+@pytest.fixture(autouse=True)
+def _stub_apply_page_mode(monkeypatch):
+    """cmd_new applies a page mode via a Docs API call; stub it here so these
+    behavior tests don't touch auth/network. Page-mode behavior is covered in
+    test_page_mode.py."""
+    monkeypatch.setattr("gdoc.cli._apply_page_mode", lambda *a, **k: None)
+
+
 def _make_args(command, **overrides):
     """Build a SimpleNamespace mimicking parsed args."""
     defaults = {
@@ -288,7 +296,10 @@ class TestCmdShare:
     def test_share_default_role_reader(self, mock_perm, _pf, _update, capsys):
         args = _make_args("share", doc="abc123", email="alice@co.com")
         cmd_share(args)
-        mock_perm.assert_called_once_with("abc123", "alice@co.com", "reader")
+        mock_perm.assert_called_once_with(
+            "abc123", email="alice@co.com", role="reader",
+            domain=None, anyone=False, discoverable=False,
+        )
 
     @patch("gdoc.state.update_state_after_command")
     @patch("gdoc.notify.pre_flight", return_value=None)
@@ -296,7 +307,10 @@ class TestCmdShare:
     def test_share_writer_role(self, mock_perm, _pf, _update):
         args = _make_args("share", doc="abc123", email="alice@co.com", role="writer", quiet=True)
         cmd_share(args)
-        mock_perm.assert_called_once_with("abc123", "alice@co.com", "writer")
+        mock_perm.assert_called_once_with(
+            "abc123", email="alice@co.com", role="writer",
+            domain=None, anyone=False, discoverable=False,
+        )
 
     @patch("gdoc.state.update_state_after_command")
     @patch("gdoc.notify.pre_flight", return_value=None)
@@ -304,7 +318,10 @@ class TestCmdShare:
     def test_share_commenter_role(self, mock_perm, _pf, _update):
         args = _make_args("share", doc="abc123", email="alice@co.com", role="commenter", quiet=True)
         cmd_share(args)
-        mock_perm.assert_called_once_with("abc123", "alice@co.com", "commenter")
+        mock_perm.assert_called_once_with(
+            "abc123", email="alice@co.com", role="commenter",
+            domain=None, anyone=False, discoverable=False,
+        )
 
     @patch("gdoc.state.update_state_after_command")
     @patch("gdoc.notify.pre_flight", return_value=None)
