@@ -1225,7 +1225,9 @@ def _prepare_text_replacement(
     `edit` reads the default view (legacy `body`, or the named tab).
     `suggest` always reads every tab with SUGGESTIONS_INLINE — the only
     view whose indexes match what a suggest-mode batchUpdate addresses —
-    and targets an explicit tab (the first when --tab is absent).
+    and targets an explicit tab (the first when no tab is named). The
+    target tab comes from `--tab` or the doc URL's `?tab=` via
+    `_effective_tab` (`--tab` wins; a URL `t.0` counts as absent).
     """
     quiet = getattr(args, "quiet", False)
     replace_all = getattr(args, "all", False)
@@ -1634,8 +1636,8 @@ def _tab_read_version(state, tab_id: str):
 def _global_read_baseline(state):
     """Global last_read_version, gated on whole-doc provenance.
 
-    Pre-0.20 state files stored a `cat --tab A` version in
-    last_read_version, so without the 0.20+ provenance marker the global
+    Pre-0.22 state files stored a `cat --tab A` version in
+    last_read_version, so without the 0.22+ provenance marker the global
     baseline is ambiguous and must not authorize a tab-scoped write —
     return None and let the guard fail closed (fresh `cat` required).
     """

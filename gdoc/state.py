@@ -23,8 +23,8 @@ class DocState:
     # update_state_after_command). Old state files load with an empty dict.
     tab_read_versions: dict[str, int] = field(default_factory=dict)
     # Provenance for last_read_version: True when it was written by gdoc
-    # >= 0.20, whose tab-scoped reads no longer touch the global baseline.
-    # Pre-0.20 `cat --tab A` stored its version in last_read_version, so a
+    # >= 0.22, whose tab-scoped reads no longer touch the global baseline.
+    # Pre-0.22 `cat --tab A` stored its version in last_read_version, so a
     # legacy global baseline is ambiguous and must not authorize a
     # tab-scoped write — legacy files load as False and the tab guard
     # fails closed (fresh `cat` required). A downgrade round-trip strips
