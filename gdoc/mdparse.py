@@ -479,6 +479,11 @@ def to_docs_requests(
 
     requests: list[dict] = []
 
+    # Style ranges are Python code-point offsets into plain_text; Docs API
+    # indexes are UTF-16 code units, so an emoji (non-BMP) earlier in the
+    # replacement shifts every later range by one extra unit.
+    utf16 = _utf16_prefix(parsed.plain_text)
+
     def _location(index: int) -> dict:
         loc = {"index": index}
         if tab_id:
@@ -507,7 +512,8 @@ def to_docs_requests(
             requests.append({
                 "updateParagraphStyle": {
                     "range": _range(
-                        sr.start + insert_index, sr.end + insert_index,
+                        utf16[sr.start] + insert_index,
+                        utf16[sr.end] + insert_index,
                     ),
                     "paragraphStyle": sr.style,
                     "fields": _paragraph_style_fields(sr.style),
@@ -522,7 +528,8 @@ def to_docs_requests(
             requests.append({
                 "updateTextStyle": {
                     "range": _range(
-                        sr.start + insert_index, sr.end + insert_index,
+                        utf16[sr.start] + insert_index,
+                        utf16[sr.end] + insert_index,
                     ),
                     "textStyle": sr.style,
                     "fields": _text_style_fields(sr.style),
@@ -547,8 +554,8 @@ def to_docs_requests(
         requests.append({
             "createParagraphBullets": {
                 "range": _range(
-                    sr.start + insert_index - removed,
-                    sr.end + insert_index - removed,
+                    utf16[sr.start] + insert_index - removed,
+                    utf16[sr.end] + insert_index - removed,
                 ),
                 "bulletPreset": sr.style["bulletPreset"],
             }
@@ -556,6 +563,21 @@ def to_docs_requests(
         removed += leading
 
     return requests
+
+
+def utf16_len(text: str) -> int:
+    """Length of *text* in UTF-16 code units (the Docs API index space)."""
+    return sum(2 if ord(ch) > 0xFFFF else 1 for ch in text)
+
+
+def _utf16_prefix(text: str) -> list[int]:
+    """offsets[i] = UTF-16 length of text[:i] (len(text) + 1 entries)."""
+    offsets = [0]
+    total = 0
+    for ch in text:
+        total += 2 if ord(ch) > 0xFFFF else 1
+        offsets.append(total)
+    return offsets
 
 
 def text_style_fields(style: dict) -> str:

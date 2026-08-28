@@ -65,6 +65,13 @@ class TestCellTextRange:
         ]}
         assert _cell_text_range(cell) == {"startIndex": 5, "endIndex": 8}
 
+    def test_cell_ending_with_emoji_counts_utf16_units(self):
+        """Doc indexes are UTF-16: 'hi😀\\n' spans 5 units, so the editable
+        end (excluding the final paragraph mark) is start+4 — a code-point
+        count would split the emoji's surrogate pair on delete."""
+        r = _cell_text_range(_cell("hi\U0001F600\n", 5))
+        assert r == {"startIndex": 5, "endIndex": 9}
+
 
 class TestResolveCellRange:
     def test_label_targets_cell_to_the_right(self):

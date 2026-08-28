@@ -161,12 +161,12 @@ class TestReplaceAllText:
             replace_all_text("abc123", "old", "new")
 
 
-@patch("gdoc.api.docs.get_docs_service")
 class TestGetDocsServiceCaches:
-    def test_caches_service(self, mock_get_service):
-        """Verify the @lru_cache is applied (tested indirectly via import)."""
-        from gdoc.api.docs import get_docs_service
-        assert hasattr(get_docs_service, "cache_info")
+    def test_caches_service(self):
+        """The per-account @lru_cache lives on _docs_service; the public
+        get_docs_service is a thin wrapper that resolves the account."""
+        from gdoc.api.docs import _docs_service
+        assert hasattr(_docs_service, "cache_info")
 
 
 class TestGetDocumentWithTabs:
@@ -374,6 +374,44 @@ class TestReplaceFormattedCleanupPositions:
         # j=1 (50):  50  + 6 + (3-1-1)*3 = 50  + 6 + 3 = 59
         # j=2 (10):  10  + 6 + (3-1-2)*3 = 10  + 6 + 0 = 16
         assert positions == [112, 59, 16]
+
+    @patch("gdoc.api.docs._build_cleanup_requests", return_value=[])
+    @patch("gdoc.api.docs.get_docs_service")
+    def test_cleanup_position_counts_emoji_as_two_units(self, mock_svc, mock_cleanup):
+        """Docs indexes are UTF-16: a non-BMP emoji in the replacement
+        grows the document by 2, so the cleanup position must reflect it."""
+        from gdoc.api.docs import replace_formatted
+
+        mock_svc.return_value.documents.return_value \
+            .batchUpdate.return_value.execute.return_value = {}
+        mock_svc.return_value.documents.return_value \
+            .get.return_value.execute.return_value = {"body": {"content": []}}
+
+        matches = [{"startIndex": 10, "endIndex": 13}]
+        replace_formatted("doc1", matches, "\U0001F600ab", "rev1")  # 3 chars, 4 units
+
+        pos = mock_cleanup.call_args[0][1]
+        assert pos == 14
+
+    @patch("gdoc.api.docs._insert_table")
+    @patch("gdoc.api.docs._build_cleanup_requests", return_value=[])
+    @patch("gdoc.api.docs.get_docs_service")
+    def test_table_index_after_emoji_is_utf16(
+        self, mock_svc, _cleanup, mock_table,
+    ):
+        from gdoc.api.docs import replace_formatted
+
+        mock_svc.return_value.documents.return_value \
+            .batchUpdate.return_value.execute.return_value = {}
+        mock_svc.return_value.documents.return_value \
+            .get.return_value.execute.return_value = {"body": {"content": []}}
+
+        md = "\U0001F600 x\n| a | b |\n|---|---|\n| 1 | 2 |"
+        replace_formatted("doc1", [{"startIndex": 5, "endIndex": 6}], md, "rev1")
+
+        # plain text before the table placeholder is "😀 x\n" = 4 code
+        # points but 5 UTF-16 units.
+        assert mock_table.call_args[0][1] == 5 + 5
 
     @patch("gdoc.api.docs._build_cleanup_requests", return_value=[])
     @patch("gdoc.api.docs.get_docs_service")

@@ -127,6 +127,9 @@ gdoc info DOC_ID
 # Find and replace text (supports markdown formatting)
 gdoc edit DOC_ID "old text" "**new bold text**"
 
+# Same replacement, but as a suggested edit for a human to accept
+gdoc suggest DOC_ID "old text" "new text"
+
 # Overwrite a document from a local file
 gdoc write DOC_ID draft.md
 
@@ -198,6 +201,7 @@ gdoc cat 1aBcDeFg...
 |---------|-------------|
 | `edit DOC OLD NEW` | Find and replace text with Markdown formatting, including text inside tables (`--all` for all; `--normalize` to match through smart quotes/dashes; `-` reads an argument from stdin) |
 | `edit DOC --cell ADDR NEW` | Replace a table cell by label or `ROW,COL` coordinates (`--col`, `--table`) |
+| `suggest DOC OLD NEW` | Same find-and-replace as `edit`, made as a **suggested edit** the doc's reviewers accept or reject (same `--all`/`--normalize`/`--case-sensitive`/`--tab`/`--old-file`/`--new-file`/`-` flags; inline Markdown only — see below) |
 | `write DOC FILE` | Overwrite document from a local markdown file |
 | `cells SHEET RANGE` | Write values into a spreadsheet range (`-v VALUE` per cell, `--file rows.csv`, `--stdin` for TSV; `--append` adds rows, `--user-entered` parses formulas/dates) |
 | `new TITLE` | Create a blank document (`--folder` to specify location, `--file` to import markdown with images) |
@@ -255,7 +259,82 @@ expired auth, still do).
 | `mkdir TITLE` | Create a Drive folder (`--parent FOLDER`) |
 | `mv DOC FOLDER` | Move a file into a folder (alias: `move`) |
 | `rename DOC TITLE` | Rename a file |
+| `mcp` | Serve gdoc to desktop chat apps over MCP (`--read-only`, `--allow`) |
 | `update` | Update gdoc to the latest release |
+
+## Desktop chat apps (MCP)
+
+`gdoc mcp` runs gdoc as a [Model Context Protocol](https://modelcontextprotocol.io)
+server on stdio, so clients that launch a local server — Claude Desktop,
+the Codex CLI, and others — can use gdoc without shell access.
+Each supported subcommand becomes a tool (`gdoc_cat`, `gdoc_edit`, …),
+with its parameters derived from the CLI itself.
+
+Authenticate first — the server cannot open a browser for the OAuth flow:
+
+```bash
+gdoc auth
+```
+
+**Claude Desktop** — add to `claude_desktop_config.json` (Settings →
+Developer → Edit Config), then restart the app:
+
+```json
+{
+  "mcpServers": {
+    "gdoc": {
+      "command": "gdoc",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+If the app can't find `gdoc` on its PATH, use the absolute path from
+`which gdoc`.
+
+**Codex CLI** — add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.gdoc]
+command = "gdoc"
+args = ["mcp"]
+```
+
+ChatGPT desktop itself only connects to *remote* MCP servers over HTTPS,
+so it cannot launch `gdoc mcp` directly.
+
+Useful flags:
+
+```bash
+# Reading only — nothing that can modify a Doc or Drive is exposed
+gdoc mcp --read-only
+
+# Expose a specific subset
+gdoc mcp --allow cat,find,comments,comment
+
+# Default account for every tool call (an explicit `account`
+# argument on a call still wins)
+gdoc mcp --account work
+```
+
+If `GDOC_ALLOW_COMMANDS` is set in the environment the client launches
+the server with, it restricts the tool surface too — and must include
+`mcp` for the server to start at all.
+
+How the tools differ from the CLI:
+
+- `write`, `insert`, and `new` take markdown content as inline `text`
+  instead of a local file path.
+- Parameters that name local files (`edit --old-file/--new-file`,
+  `diff FILE`/`--out`, `images --download`, …) are not exposed: a chat
+  client cannot see the server's filesystem, and hiding them keeps a
+  prompt-injected model from reading or writing files on the host.
+- `auth`, `update`, `config`, `pull`, `push`, `export`, `insert-image`,
+  and `replace-image` are not exposed: they need a browser, change the
+  install, or only work on local paths.
+- `diff` reporting "differences found" (exit code 1 in the CLI,
+  diff-style) is a normal result, not an error.
 
 ## Output modes
 
@@ -484,6 +563,65 @@ Pass `-` for the old or new argument to read it from stdin (one stream, so at mo
 ```bash
 printf 'line one\nline two' | gdoc edit DOC --cell "Notes" -
 ```
+
+## Suggesting edits
+
+`suggest` is `edit` in suggest mode: the same anchor matching, but the change is
+written with the Docs API's `writeControl.writeMode: SUGGEST`, so the original
+text stays in place and the replacement appears as a pending suggestion with an
+accept/reject control — exactly as if a reviewer had typed it in *Suggesting*
+mode.
+
+```bash
+gdoc suggest DOC "ship in Q3" "ship in Q4"
+gdoc suggest DOC "colour" "color" --all --case-sensitive
+gdoc suggest DOC "old wording" "**bold** with a [link](https://example.com)"
+gdoc suggest DOC --tab "Draft" "old" "new"
+gdoc suggest DOC --old-file before.txt --new-file after.txt
+gdoc suggest DOC "old" "new" --json
+# → {"ok": true, "suggested": 1, "suggestionIds": ["suggest.abc"],
+#    "createdSuggestionIds": ["suggest.abc"], "updatedSuggestionIds": []}
+```
+
+Terse output names the review object: `OK suggested 1 occurrence (#suggest.abc)`.
+`--plain` prints `id`, `status suggested`, `suggested N`, and `suggestion_ids`.
+Google may fold an edit adjacent to your own open suggestion into it instead of
+creating a new one; those IDs are reported under `updatedSuggestionIds`.
+
+Requirements and limits:
+
+- **Developer Preview.** Suggest mode is a Docs API
+  [Workspace Developer Preview](https://developers.google.com/workspace/preview)
+  feature gated by the OAuth client's Cloud project. Because an unenrolled
+  backend has been seen silently applying `writeMode: SUGGEST` as a direct
+  edit, `suggest` first proves enrollment with a non-mutating preview-only
+  read (`commentsViewMode`); with an unenrolled project that read is rejected,
+  the command fails with `suggest mode not available`, and nothing is written.
+  Unlike `comment --quote`, there is **no fallback**: `suggest` never degrades to
+  a direct edit.
+- **Comment or edit access.** The write is pinned to the revision the text was
+  matched at (`requiredRevisionId`) and the document is read with suggestions
+  inline; both editors and commenters get that view and the revision ID, while
+  a reader is refused (`Permission denied`). If a read ever comes back without
+  a `revisionId`, the command refuses rather than write unpinned.
+- **Inline Markdown only.** Bold, italic, strikethrough, inline code, and links
+  are suggested along with the text. Headings, lists, blockquotes, horizontal
+  rules, tables, and `--cell` are rejected before any API call — use `edit` for
+  those. Newlines are fine: they become suggested paragraph breaks, and the new
+  paragraphs inherit the anchor paragraph's style (unlike `edit`, which resets
+  inserted paragraphs to normal text). Fenced code blocks are accepted as
+  code-font paragraphs.
+- **No overlap with existing suggestions.** The document is read with
+  suggestions inline; a match that touches text someone else has already
+  suggested inserting, deleting, or restyling is refused, so a review thread is
+  never silently modified.
+- **Verified, not assumed.** Success requires `commentUpdateState: ALL_SAVED`,
+  at least one suggestion ID in the response, and a read-back showing every ID
+  as a pending suggestion. Any other outcome is an error that tells you to
+  inspect the document.
+
+Like `edit`, a suggestion is a partial write: the awareness state records the
+new document version but does not advance the read baseline.
 
 ## Import from file
 

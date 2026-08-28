@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from google.auth.exceptions import TransportError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -15,6 +16,7 @@ from gdoc.util import (
     CREDS_PATH,
     TOKEN_PATH,
     AuthError,
+    GdocError,
     get_default_account,
     get_token_path,
     set_default_account,
@@ -29,14 +31,29 @@ GOOGLE_AUTH_URI = "https://accounts.google.com/o/oauth2/auth"
 GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
 
 
-def get_credentials() -> Credentials:
-    """Load or refresh credentials. Returns valid Credentials or raises AuthError."""
-    from gdoc.util import get_active_account
-    account = get_active_account() or get_default_account()
+# Sentinel default: "resolve the account from the current context".
+_RESOLVE = object()
+
+
+def get_credentials(account=_RESOLVE) -> Credentials:
+    """Load or refresh credentials. Returns valid Credentials.
+
+    Raises AuthError when there are no usable credentials (missing token,
+    revoked or invalid grant — re-authenticating is the fix) and GdocError
+    when a network failure prevents the token refresh (retrying is the
+    fix; the stored credentials are fine).
+
+    `account` is a *resolved* account name (None = legacy token) — the
+    per-account service caches pass their cache key here so the credentials
+    are guaranteed to match it. Omit it to resolve from the current context.
+    """
+    from gdoc.util import resolve_account, token_path_for
+    if account is _RESOLVE:
+        account = resolve_account()
     if not account:
         print("account: default (use --account to switch)", file=sys.stderr)
 
-    token_path = get_token_path()
+    token_path = token_path_for(account)
     creds = _load_token(token_path)
 
     if creds and creds.valid:
@@ -47,6 +64,13 @@ def get_credentials() -> Credentials:
             creds.refresh(Request())
             _save_token(creds, token_path)
             return creds
+        except TransportError as e:
+            # A network failure during refresh is not bad credentials —
+            # "run `gdoc auth`" would be wrong advice for a Wi-Fi blip.
+            raise GdocError(
+                f"network error while refreshing credentials ({e}); "
+                "check the connection and try again"
+            )
         except Exception:
             pass
 

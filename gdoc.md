@@ -26,6 +26,7 @@ gdoc edit DOC_ID "old" "new" --normalize     # Match through smart quotes/dashes
 gdoc edit DOC_ID --cell "Label" "new value"  # Replace the table cell right of a label
 gdoc edit DOC_ID --cell 7,1 "new value"      # Replace cell by ROW,COL (--table N, default 0)
 printf 'multi\nline' | gdoc edit DOC_ID --cell "Notes" -  # '-' reads an arg from stdin
+gdoc suggest DOC_ID "old text" "new text"    # Same as edit, but as a suggested edit to review
 gdoc write DOC_ID FILE.md                    # Overwrite doc body from local markdown
 
 gdoc comments DOC_ID                         # List open comments
@@ -373,5 +374,4 @@ No other dependencies. Intentionally minimal.
 - `gdoc diff DOC_ID FILE.md` — show diff between remote and local
 - `gdoc pull DOC_ID FILE.md` — alias for `cat DOC_ID > FILE.md`  
 - `gdoc watch DOC_ID` — poll for changes / new comments
-- `gdoc suggest DOC_ID "old" "new"` — make a suggestion instead of direct edit (Docs API supports `suggestInsertText` etc.)
 - `gdoc export DOC_ID --format pdf|docx|html`

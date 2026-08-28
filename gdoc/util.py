@@ -2,6 +2,8 @@
 
 import json
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 
@@ -46,8 +48,13 @@ CREDS_PATH = CONFIG_DIR / "credentials.json"
 STATE_DIR = CONFIG_DIR / "state"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
-# Multi-account support: when set, token is stored under a per-account dir
-_active_account: str | None = None
+# Multi-account support: when set, token is stored under a per-account dir.
+# A ContextVar rather than a module global so a long-lived multi-account
+# process (`gdoc mcp`, a hosted server) can scope the account per call,
+# thread, or task; the CLI simply sets it once at startup.
+_active_account: ContextVar[str | None] = ContextVar(
+    "gdoc_active_account", default=None
+)
 _VALID_ACCOUNT = re.compile(r'^[\w.\-@]+$')
 
 
@@ -62,16 +69,46 @@ def _validate_account_name(account: str) -> None:
 
 
 def set_active_account(account: str | None) -> None:
-    """Set the active account for token resolution."""
-    global _active_account
+    """Set the active account for the rest of the current context.
+
+    Use account_context() instead to scope the account to a single call.
+    """
     if account:
         _validate_account_name(account)
-    _active_account = account
+    _active_account.set(account)
 
 
 def get_active_account() -> str | None:
     """Return the active account, if set."""
-    return _active_account
+    return _active_account.get()
+
+
+@contextmanager
+def account_context(account: str | None):
+    """Scope the active account to a with-block.
+
+    Per-request credential injection for long-lived processes: the previous
+    account is restored on exit even if the body called set_active_account()
+    itself, so one call's account can never leak into the next.
+    """
+    if account:
+        _validate_account_name(account)
+    token = _active_account.set(account)
+    try:
+        yield
+    finally:
+        _active_account.reset(token)
+
+
+def resolve_account() -> str | None:
+    """The account name the current context's credentials resolve to.
+
+    Explicit active account first, then the configured default; None means
+    the legacy un-named token. Service caches key on this value, so an
+    unpinned call in a long-lived process picks up a default-account change
+    at call time.
+    """
+    return _active_account.get() or get_default_account()
 
 
 def _load_config() -> dict:
@@ -142,19 +179,21 @@ def set_default_page_mode(mode: str) -> None:
     _save_config(config)
 
 
+def token_path_for(account: str | None) -> Path:
+    """Token path for a resolved account name (None = legacy token)."""
+    if account:
+        return CONFIG_DIR / "accounts" / account / "token.json"
+    return TOKEN_PATH
+
+
 def get_token_path() -> Path:
-    """Return the token path for the active account.
+    """Return the token path for the current context's account.
 
     Configured default accounts resolve to the named account token.
     CONFIG_DIR/token.json is only a legacy fallback.
     Named accounts use CONFIG_DIR/accounts/<account>/token.json.
     """
-    if _active_account:
-        return CONFIG_DIR / "accounts" / _active_account / "token.json"
-    default_account = get_default_account()
-    if default_account:
-        return CONFIG_DIR / "accounts" / default_account / "token.json"
-    return TOKEN_PATH
+    return token_path_for(resolve_account())
 
 _PATTERNS = [
     re.compile(r"/d/([a-zA-Z0-9_-]+)"),

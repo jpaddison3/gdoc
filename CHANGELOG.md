@@ -4,13 +4,14 @@ All notable changes to `gdoc` are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.20.0] — 2026-08-07
+## [0.22.0] — 2026-08-28
 
 ### Added
 - **Document URLs honor their `?tab=` deep link.** Google's editor appends
   `?tab=<id>` when you open a tab, so a pasted tab URL now acts exactly like
   `--tab <id>` for `cat`, `edit` (incl. `--cell`), `write`, `insert`, `toc`,
-  `structure`, and `insert-image` — previously the tab was silently dropped
+  `structure`, `insert-image`, and `suggest` (0.21.0's suggested-edit
+  command, wired in via this release's merge) — previously the tab was silently dropped
   and the command operated on the first tab (or whole doc). An explicit
   `--tab`/`--all-tabs` still overrides the URL.
 
@@ -99,6 +100,104 @@ All notable changes to `gdoc` are documented here. This project follows
 ### Docs
 - Corrected the README Tabs section: the Drive export returns **all** tabs
   (each under a `# **Tab title**` heading), not just the first.
+## [0.21.0] — 2026-08-26
+
+### Added
+- **Suggested edits: `gdoc suggest DOC OLD NEW`.** The same find-and-replace
+  as `edit` (`--all`, `--case-sensitive`, `--normalize`, `--tab`,
+  `--old-file`/`--new-file`, `-` for stdin), but the batchUpdate runs with
+  `writeControl.writeMode: SUGGEST` (Docs API Developer Preview), so the
+  change lands as a pending suggestion with an accept/reject control and
+  the original text stays until a reviewer accepts it. Output names the
+  review object (`OK suggested 1 occurrence (#suggest.abc)`; `--json`
+  reports `suggestionIds`, `createdSuggestionIds`, `updatedSuggestionIds`).
+  Success is verified, not assumed: HTTP 200 plus `commentUpdateState:
+  ALL_SAVED`, at least one suggestion ID in `suggestionResponses`, and a
+  `SUGGESTIONS_INLINE` read-back that shows every ID — anything less is an
+  error, and there is deliberately no fallback to a direct edit: a
+  non-mutating preview-only read proves the project is enrolled *before*
+  the write (an unenrolled project fails with `suggest mode not
+  available`). Inline style ranges in the replacement are converted to
+  UTF-16 (`to_docs_requests`, also fixing `edit`/`insert` with emoji in
+  formatted replacement text). The document
+  is read with suggestions inline before matching and a match that touches
+  an existing suggested insertion, deletion, or style change is refused, so
+  another reviewer's thread is never modified by accident. Replacement text
+  may use inline Markdown only (bold, italic, strikethrough, code, links);
+  headings, lists, blockquotes, horizontal rules, tables, and `--cell` are
+  rejected before any API call. Needs comment or edit access on the doc.
+  Exposed over MCP as `gdoc_suggest` (a write tool). `edit` and `suggest`
+  share one text-resolution/matching front half (`_resolve_replacement_text`,
+  `_prepare_text_replacement`) and one request builder
+  (`_build_replacement_requests`); `edit` behaviour is unchanged.
+
+### Fixed
+- **`edit --all` with a self-overlapping anchor** (`aa` matching twice in
+  `aaa`) is refused before any write (exit 3) instead of corrupting the
+  document — the last-to-first delete/insert plan would land on
+  already-shifted text. The same guard `suggest` ships with.
+- **`edit --cell` on a cell containing characters outside the Basic
+  Multilingual Plane** (emoji) computed the cell's editable end in code
+  points instead of UTF-16 units, so the replacement range could split a
+  surrogate pair (a 400 from the API) or leave the cell's last character
+  behind.
+- **MCP: a literal `-` in `old_text`/`new_text` of `gdoc_edit` and
+  `gdoc_suggest` is rejected.** The CLI reads `-` from stdin, but over MCP
+  stdin is the JSON-RPC stream (shielded to empty for the call), so
+  `new_text: "-"` silently became an empty replacement — deleting the
+  matched text instead of erroring.
+- **MCP: an unpinned tool call resolves the configured default account
+  once at call entry** instead of per service access, so a
+  `gdoc auth --set-default` made while a command runs can no longer hand
+  the same command's read and write to different accounts.
+
+## [0.20.1] — 2026-08-15
+
+### Changed
+- **Per-request credential injection.** The active account is now a
+  `contextvars.ContextVar` scoped per call (`account_context()`), and the
+  four cached API service objects are keyed by the resolved account
+  instead of one-per-process, with `get_credentials()` accepting the
+  resolved account so a cache key can never disagree with the credentials
+  behind it. Two accounts used concurrently in one process each see only
+  their own credentials and services, an unpinned call in a long-lived
+  process picks up `gdoc auth --set-default` changes at call time, and the
+  token file's on-disk identity travels in the cache key so a token
+  re-authenticated or removed in another terminal is never served from a
+  stale cached service. The CLI
+  behaves identically; the MCP server's account-reset machinery collapses
+  into one `account_context` per tool call. Groundwork for the hosted
+  multi-user server (#45).
+
+## [0.20.0] — 2026-08-14
+
+### Added
+- **MCP server: `gdoc mcp`.** Serves gdoc over the Model Context Protocol
+  on stdio, so clients that launch a local server (Claude Desktop, the
+  Codex CLI) can read and edit Docs without shell access —
+  previously gdoc was only reachable from a coding agent. 29 subcommands
+  are exposed as tools, with input schemas derived from the argparse
+  parser so new flags surface automatically. `--read-only` restricts the
+  surface to commands that cannot modify Docs or Drive, `--allow` takes
+  an explicit subset (`GDOC_ALLOW_COMMANDS` is honoured too), and
+  `--account` sets the account for every call (an explicit `account`
+  argument on a call wins). `write`, `insert`, and `new` take markdown
+  content as inline `text`, since a chat client has no filesystem to
+  write a markdown file to; parameters that name local files
+  (`edit --old-file/--new-file`, `diff FILE`/`--out`/`--format html`,
+  `images --download`, `cells --file/--stdin`) are not exposed at all,
+  so a prompt-injected model cannot read or write files on the host.
+  `diff` reporting "differences found" (CLI exit code 1) is a normal
+  result, not a tool error. No new dependencies: the stdio transport is
+  newline-delimited JSON-RPC 2.0, implemented in `gdoc/mcp.py`. Commands
+  run in-process through the same dispatch as the CLI, factored out of
+  `main()` as `run_argv()`; each call runs with stdin detached so a
+  stdin-reading command can never swallow the protocol stream.
+
+### Fixed
+- Markdown file reads and writes (`write`, `insert`, `new --file`,
+  `push`, `pull`, sync hooks) now use explicit UTF-8 instead of the
+  locale default encoding.
 
 ## [0.19.0] — 2026-08-07
 

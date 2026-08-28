@@ -3,6 +3,7 @@
 import argparse
 import os
 import sys
+from dataclasses import dataclass
 
 from gdoc import __version__
 from gdoc.revdiff import DEFAULT_CONTEXT, DEFAULT_MIN_COMMON
@@ -774,7 +775,7 @@ def cmd_insert(args) -> int:
     if not os.path.isfile(file_path):
         raise GdocError(f"file not found: {file_path}", exit_code=3)
     try:
-        with open(file_path) as f:
+        with open(file_path, encoding="utf-8") as f:
             content = f.read()
     except OSError as e:
         raise GdocError(f"cannot read file: {e}", exit_code=3) from e
@@ -1133,18 +1134,23 @@ def _read_file(path: str) -> str:
     return content
 
 
-def cmd_edit(args) -> int:
-    """Handler for `gdoc edit`."""
-    doc_id, url_tab = _resolve_doc_ref(args.doc)
-    quiet = getattr(args, "quiet", False)
-    replace_all = getattr(args, "all", False)
-    case_sensitive = getattr(args, "case_sensitive", False)
-    normalize = getattr(args, "normalize", False)
-    cell = getattr(args, "cell", None)
-    col = getattr(args, "col", None)
-    table_index = getattr(args, "table", None)
+@dataclass
+class _ReplacementPlan:
+    """Front half of a find/replace shared by `edit` and `suggest`."""
 
-    # Resolve text from args or files (fail fast before API calls)
+    quiet: bool
+    change_info: object  # ChangeInfo | None
+    matches: list
+    revision_id: str
+    tab_id: str | None
+    search_body: dict
+
+
+def _resolve_replacement_text(args, cell) -> tuple[str | None, str | None]:
+    """Resolve old/new text from positionals, `-` (stdin), or --old/--new-file.
+
+    Fails fast (exit 3) before any API call when the combination is invalid.
+    """
     old_text = args.old_text
     new_text = args.new_text
     old_file = getattr(args, "old_file", None)
@@ -1207,6 +1213,27 @@ def cmd_edit(args) -> int:
                 "(or use --old-file/--new-file)",
                 exit_code=3,
             )
+    return old_text, new_text
+
+
+def _prepare_text_replacement(
+    args, doc_id: str, old_text: str | None,
+    *, suggest: bool = False, url_tab: str | None = None,
+) -> _ReplacementPlan:
+    """Pre-flight, read the document, and locate the ranges to replace.
+
+    `edit` reads the default view (legacy `body`, or the named tab).
+    `suggest` always reads every tab with SUGGESTIONS_INLINE — the only
+    view whose indexes match what a suggest-mode batchUpdate addresses —
+    and targets an explicit tab (the first when --tab is absent).
+    """
+    quiet = getattr(args, "quiet", False)
+    replace_all = getattr(args, "all", False)
+    case_sensitive = getattr(args, "case_sensitive", False)
+    normalize = getattr(args, "normalize", False)
+    cell = getattr(args, "cell", None)
+    col = getattr(args, "col", None)
+    table_index = getattr(args, "table", None)
 
     # Pre-flight awareness check
     from gdoc.notify import pre_flight
@@ -1219,12 +1246,40 @@ def cmd_edit(args) -> int:
         print("WARN: doc changed since last read", file=sys.stderr)
 
     # Get document structure + revision ID
-    from gdoc.api.docs import find_text_in_document, get_document, replace_formatted
+    from gdoc.api.docs import find_text_in_document, get_document
 
     tab_name, _ = _effective_tab(url_tab, getattr(args, "tab", None))
     tab_id = None
 
-    if tab_name:
+    if suggest:
+        from gdoc.api.docs import (
+            SUGGESTIONS_INLINE,
+            flatten_tabs,
+            get_document_structure,
+            resolve_tab,
+        )
+        try:
+            doc = get_document_structure(
+                doc_id, suggestions_view_mode=SUGGESTIONS_INLINE,
+            )
+        except GdocError as e:
+            # Live: a reader gets 403 "You do not have permission to access
+            # the document suggestions." on this view; commenters and
+            # editors read it fine.
+            if str(e).startswith("Permission denied"):
+                raise GdocError(
+                    f"{e} (reading suggestions inline needs comment or "
+                    "edit access on the document)", exit_code=e.exit_code,
+                )
+            raise
+        revision_id = doc.get("revisionId", "")
+        tabs = flatten_tabs(doc.get("tabs", []))
+        if not tabs:
+            raise GdocError(f"document has no tabs: {doc_id}")
+        tab_match = resolve_tab(tabs, tab_name) if tab_name else tabs[0]
+        tab_id = tab_match["id"]
+        search_body = tab_match["body"]
+    elif tab_name:
         from gdoc.api.docs import flatten_tabs, get_document_with_tabs, resolve_tab
         doc = get_document_with_tabs(doc_id)
         revision_id = doc.get("revisionId", "")
@@ -1265,6 +1320,23 @@ def cmd_edit(args) -> int:
                 exit_code=3,
             )
 
+    return _ReplacementPlan(
+        quiet=quiet, change_info=change_info, matches=matches,
+        revision_id=revision_id, tab_id=tab_id, search_body=search_body,
+    )
+
+
+def cmd_edit(args) -> int:
+    """Handler for `gdoc edit`."""
+    doc_id, url_tab = _resolve_doc_ref(args.doc)
+    cell = getattr(args, "cell", None)
+
+    # Resolve text from args or files (fail fast before API calls)
+    old_text, new_text = _resolve_replacement_text(args, cell)
+
+    plan = _prepare_text_replacement(args, doc_id, old_text, url_tab=url_tab)
+    matches = plan.matches
+
     # Check if replacement contains tables — not supported with --all
     from gdoc.mdparse import parse_markdown as _parse_md
     _parsed = _parse_md(new_text)
@@ -1275,8 +1347,10 @@ def cmd_edit(args) -> int:
         )
 
     # Perform formatted replacement via Docs API batchUpdate
+    from gdoc.api.docs import replace_formatted
+
     occurrences = replace_formatted(
-        doc_id, matches, new_text, revision_id, tab_id=tab_id,
+        doc_id, matches, new_text, plan.revision_id, tab_id=plan.tab_id,
     )
 
     # Get post-edit version for state tracking (Decision #12)
@@ -1286,7 +1360,7 @@ def cmd_edit(args) -> int:
     command_version = version_data.get("version")
 
     # Output
-    from gdoc.format import get_output_mode, format_json
+    from gdoc.format import format_json, get_output_mode
 
     mode = get_output_mode(args)
     label = "occurrence" if occurrences == 1 else "occurrences"
@@ -1294,7 +1368,7 @@ def cmd_edit(args) -> int:
         print(format_json(replaced=occurrences))
     elif mode == "plain":
         print(f"id\t{doc_id}")
-        print(f"status\tupdated")
+        print("status\tupdated")
     else:
         print(f"OK replaced {occurrences} {label}")
 
@@ -1302,10 +1376,137 @@ def cmd_edit(args) -> int:
     from gdoc.state import update_state_after_command
 
     update_state_after_command(
-        doc_id, change_info, command="edit",
-        quiet=quiet, command_version=command_version,
+        doc_id, plan.change_info, command="edit",
+        quiet=plan.quiet, command_version=command_version,
     )
 
+    return 0
+
+
+def cmd_suggest(args) -> int:
+    """Handler for `gdoc suggest`: a find/replace made as a suggested edit.
+
+    Same matching as `edit`, but the batchUpdate runs with
+    writeControl.writeMode=SUGGEST (Docs API Developer Preview) so the
+    change lands as a reviewable suggestion — the original text stays in
+    place until someone accepts it. There is no fallback: if suggest mode
+    is unavailable or unverifiable the command fails and nothing is
+    edited directly.
+    """
+    doc_id, url_tab = _resolve_doc_ref(args.doc)
+
+    old_text, new_text = _resolve_replacement_text(args, None)
+
+    # Structural Markdown needs the multi-batch cleanup/table phases that
+    # suggest mode does not run — reject it before any API call.
+    from gdoc.api.docs import check_inline_only_markdown
+    from gdoc.mdparse import parse_markdown
+
+    check_inline_only_markdown(parse_markdown(new_text))
+
+    # Capture the token identity before the document read: the write
+    # verifies against this baseline, so the grant that read the ranges is
+    # the grant that authors the suggestion (see suggest_replacement).
+    from gdoc.api import account_cache_key
+    from gdoc.api.docs import _token_identity
+
+    read_identity = _token_identity(account_cache_key()[0])
+
+    plan = _prepare_text_replacement(
+        args, doc_id, old_text, suggest=True, url_tab=url_tab,
+    )
+
+    # Never touch an existing review thread by accident: Google may merge a
+    # change into an overlapping open suggestion, so refuse any match that
+    # intersects one (v1; an explicit opt-in can come later).
+    from gdoc.api.docs import find_suggestions_in_range
+
+    for m in plan.matches:
+        overlapping = find_suggestions_in_range(
+            plan.search_body, m["startIndex"], m["endIndex"],
+        )
+        if overlapping:
+            ids = ", ".join(sorted(overlapping))
+            raise GdocError(
+                f"match at index {m['startIndex']} overlaps existing "
+                f"suggestion(s) {ids}; accept or reject them first, or "
+                "choose an anchor outside the suggested text",
+                exit_code=3,
+            )
+
+    from gdoc.api.docs import suggest_replacement
+
+    result = suggest_replacement(
+        doc_id, plan.matches, new_text, plan.revision_id, tab_id=plan.tab_id,
+        expected_token_identity=read_identity,
+    )
+
+    # The suggestion is saved and verified at this point. A failure of the
+    # follow-up version lookup must not turn that into an ordinary error
+    # that hides the IDs — report success, then warn that state was not
+    # refreshed.
+    from gdoc.api.drive import get_file_version
+
+    version_error = None
+    command_version = None
+    try:
+        command_version = get_file_version(doc_id).get("version")
+    except Exception as e:  # noqa: BLE001 — post-mutation; any failure here
+        # (HttpError already translated to GdocError, but also transport
+        # ConnectionError/timeout) must not hide the saved suggestion IDs.
+        version_error = e
+
+    from gdoc.format import format_json, get_output_mode
+
+    mode = get_output_mode(args)
+    ids = result.suggestion_ids
+    if mode == "json":
+        print(format_json(
+            suggested=result.occurrences,
+            suggestionIds=ids,
+            createdSuggestionIds=result.created_suggestion_ids,
+            updatedSuggestionIds=result.updated_suggestion_ids,
+        ))
+    elif mode == "plain":
+        print(f"id\t{doc_id}")
+        print("status\tsuggested")
+        print(f"suggested\t{result.occurrences}")
+        print("suggestion_ids\t" + ",".join(ids))
+    else:
+        label = "occurrence" if result.occurrences == 1 else "occurrences"
+        tags = ", ".join(f"#{i}" for i in ids)
+        print(f"OK suggested {result.occurrences} {label} ({tags})")
+
+    if version_error is not None:
+        print(
+            "WARN: suggestion saved ("
+            + ", ".join(f"#{i}" for i in ids)
+            + f") but the document version could not be refreshed: "
+            f"{version_error}; awareness state not updated",
+            file=sys.stderr,
+        )
+        return 0
+
+    # A suggestion is a partial write like `edit`: record the new version
+    # but do not advance the read baseline (update_state_after_command
+    # only does that for full-document writes).
+    from gdoc.state import update_state_after_command
+
+    try:
+        update_state_after_command(
+            doc_id, plan.change_info, command="suggest",
+            quiet=plan.quiet, command_version=command_version,
+        )
+    except Exception as e:  # noqa: BLE001 — post-mutation; the local state
+        # file failing to write (read-only dir, full disk) must not turn
+        # the saved suggestion into a reported failure that an automated
+        # caller would blindly retry.
+        print(
+            "WARN: suggestion saved ("
+            + ", ".join(f"#{i}" for i in ids)
+            + f") but awareness state was not persisted: {e}",
+            file=sys.stderr,
+        )
     return 0
 
 
@@ -1532,7 +1733,7 @@ def cmd_write(args) -> int:
     if not os.path.isfile(file_path):
         raise GdocError(f"file not found: {file_path}", exit_code=3)
     try:
-        with open(file_path) as f:
+        with open(file_path, encoding="utf-8") as f:
             content = f.read()
     except OSError as e:
         raise GdocError(f"cannot read file: {e}", exit_code=3) from e
@@ -1691,7 +1892,7 @@ def cmd_pull(args) -> int:
     content = add_frontmatter(markdown, front)
 
     try:
-        with open(file_path, "w") as f:
+        with open(file_path, "w", encoding="utf-8") as f:
             f.write(content)
     except OSError as e:
         raise GdocError(f"cannot write file: {e}", exit_code=3)
@@ -1751,7 +1952,7 @@ def cmd_push(args) -> int:
     if not os.path.isfile(file_path):
         raise GdocError(f"file not found: {file_path}", exit_code=3)
     try:
-        with open(file_path) as f:
+        with open(file_path, encoding="utf-8") as f:
             content = f.read()
     except OSError as e:
         raise GdocError(f"cannot read file: {e}", exit_code=3)
@@ -1847,7 +2048,7 @@ def cmd_sync_hook(args) -> int:
         if not os.path.isfile(file_path):
             return 0
 
-        with open(file_path) as f:
+        with open(file_path, encoding="utf-8") as f:
             content = f.read()
 
         from gdoc.frontmatter import parse_frontmatter
@@ -1916,7 +2117,7 @@ def cmd_pull_hook(args) -> int:
         if not os.path.isfile(file_path):
             return 0
 
-        with open(file_path) as f:
+        with open(file_path, encoding="utf-8") as f:
             content = f.read()
 
         from gdoc.frontmatter import parse_frontmatter
@@ -1952,7 +2153,7 @@ def cmd_pull_hook(args) -> int:
 
         new_content = add_frontmatter(markdown, {"gdoc": doc_id, "title": title})
 
-        with open(file_path, "w") as f:
+        with open(file_path, "w", encoding="utf-8") as f:
             f.write(new_content)
 
         print(
@@ -3218,7 +3419,7 @@ def _cmd_new_from_file(args) -> int:
     if not os.path.isfile(file_path):
         raise GdocError(f"file not found: {file_path}", exit_code=3)
     try:
-        with open(file_path) as f:
+        with open(file_path, encoding="utf-8") as f:
             content = f.read()
     except OSError as e:
         raise GdocError(f"cannot read file: {e}", exit_code=3)
@@ -3729,6 +3930,22 @@ def cmd_update(args) -> int:
     return run_update()
 
 
+def cmd_mcp(args) -> int:
+    """Handler for `gdoc mcp`: serve gdoc over MCP on stdio."""
+    from gdoc.mcp import MCPServer
+
+    allow = None
+    if getattr(args, "allow", None):
+        allow = {c.strip().lower() for c in args.allow.split(",") if c.strip()}
+
+    server = MCPServer(
+        read_only=getattr(args, "read_only", False),
+        allow=allow,
+        account=getattr(args, "account", None),
+    )
+    return server.serve()
+
+
 def build_parser() -> GdocArgumentParser:
     """Build the CLI argument parser with all subcommands."""
     parser = GdocArgumentParser(
@@ -3782,6 +3999,35 @@ def build_parser() -> GdocArgumentParser:
     # update
     update_p = sub.add_parser("update", help="Update gdoc to the latest version")
     update_p.set_defaults(func=cmd_update)
+
+    # mcp
+    mcp_p = sub.add_parser(
+        "mcp",
+        help="Serve gdoc to desktop chat clients over MCP (stdio)",
+        description=(
+            "Run gdoc as a Model Context Protocol server on stdin/stdout, so "
+            "clients that launch a local stdio server — Claude Desktop, the "
+            "Codex CLI, and others — can read and edit Google Docs "
+            "without shell access. Authenticate first with `gdoc auth`; the "
+            "server cannot open a browser for the OAuth flow."
+        ),
+    )
+    mcp_p.add_argument(
+        "--read-only",
+        action="store_true",
+        help="Expose only commands that cannot modify Docs or Drive",
+    )
+    mcp_p.add_argument(
+        "--allow",
+        metavar="COMMANDS",
+        help="Comma-separated subcommands to expose (default: all supported)",
+    )
+    mcp_p.add_argument(
+        "--account",
+        default=os.environ.get("GDOC_ACCOUNT"),
+        help="Google account to use for every tool call",
+    )
+    mcp_p.set_defaults(func=cmd_mcp)
 
     # auth
     auth_p = sub.add_parser("auth", parents=[output_parent], help="Authenticate with Google")
@@ -4055,6 +4301,45 @@ def build_parser() -> GdocArgumentParser:
         help="Target a specific tab by title or ID (or pass a URL with ?tab=)",
     )
     edit_p.set_defaults(func=cmd_edit)
+
+    # suggest
+    suggest_p = sub.add_parser(
+        "suggest", parents=[output_parent],
+        help="Find and replace text as a suggested edit (review, not commit)",
+        epilog="Like `edit`, but the change is made in suggest mode (Docs API "
+               "Developer Preview): the original text stays until a reviewer "
+               "accepts it. Replacement text supports inline markdown only "
+               "(bold, italic, strikethrough, code, links); headings, lists, "
+               "and tables are rejected. Needs comment or edit access on the "
+               "doc and an OAuth client from a preview-enrolled Cloud "
+               "project; never falls back to a direct edit.",
+    )
+    suggest_p.add_argument("doc", help="Document ID or URL")
+    suggest_p.add_argument(
+        "old_text", nargs="?", default=None, help="Text to find",
+    )
+    suggest_p.add_argument(
+        "new_text", nargs="?", default=None, help="Replacement text",
+    )
+    suggest_p.add_argument("--old-file", help="Read old text from file")
+    suggest_p.add_argument("--new-file", help="Read new text from file")
+    suggest_p.add_argument(
+        "--all", action="store_true", help="Suggest for all occurrences"
+    )
+    suggest_p.add_argument(
+        "--case-sensitive", action="store_true", help="Case-sensitive matching"
+    )
+    suggest_p.add_argument(
+        "--normalize", action="store_true",
+        help="Match through smart-quote/dash differences (\u2019 matches ')",
+    )
+    suggest_p.add_argument(
+        "--quiet", action="store_true", help="Skip pre-flight checks"
+    )
+    suggest_p.add_argument(
+        "--tab", help="Target a specific tab by title or ID"
+    )
+    suggest_p.set_defaults(func=cmd_suggest)
 
     # diff
     diff_p = sub.add_parser(
@@ -4564,14 +4849,14 @@ def _is_top_level_help_invocation(argv: list[str]) -> bool:
     return rest[0] in ("--help", "-h")
 
 
-def main() -> int:
-    """Entry point for the gdoc CLI."""
-    if _is_top_level_help_invocation(sys.argv):
-        from gdoc.update import auto_update_for_help
-        auto_update_for_help()
+def run_argv(argv: list[str] | None = None, *, check_updates: bool = True) -> int:
+    """Parse an argv list and run the matching subcommand.
 
+    Shared by `main()` and by the MCP server (`gdoc mcp`), which dispatches
+    tool calls in-process rather than shelling out to a new interpreter.
+    """
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.command is None:
         parser.print_help(sys.stderr)
@@ -4602,11 +4887,23 @@ def main() -> int:
             set_active_account(account)
 
         # Check for updates (skip for the update command itself and internal hooks)
-        if args.command not in ("update", "_sync-hook", "_pull-hook"):
+        if check_updates and args.command not in (
+            "update", "_sync-hook", "_pull-hook", "mcp",
+        ):
             from gdoc.update import check_for_update
             check_for_update()
 
-        return args.func(args)
+        # Pin one account for the whole invocation: unpinned, every service
+        # access re-resolves the configured default, so a `gdoc auth
+        # --set-default` from another process could hand one command's read
+        # and write to different accounts. The MCP server is exempt — it
+        # pins per tool call instead, so a default changed mid-serve is
+        # still picked up on the next call.
+        if args.command == "mcp":
+            return args.func(args)
+        from gdoc.util import account_context, resolve_account
+        with account_context(resolve_account()):
+            return args.func(args)
     except AuthError as e:
         print(f"ERR: {e}", file=sys.stderr)
         return 2
@@ -4616,3 +4913,12 @@ def main() -> int:
     except Exception as e:
         print(f"ERR: unexpected error: {e}", file=sys.stderr)
         return 1
+
+
+def main() -> int:
+    """Entry point for the gdoc CLI."""
+    if _is_top_level_help_invocation(sys.argv):
+        from gdoc.update import auto_update_for_help
+        auto_update_for_help()
+
+    return run_argv()

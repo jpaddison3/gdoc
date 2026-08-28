@@ -419,6 +419,32 @@ class TestGetCredentials:
             with pytest.raises(AuthError, match="Not authenticated"):
                 get_credentials()
 
+    def test_network_failure_during_refresh_is_not_an_auth_error(self):
+        """A TransportError from the refresh (Wi-Fi blip, DNS failure) must
+        not become "Not authenticated. Run `gdoc auth`" — the stored
+        credentials are fine and re-authenticating is the wrong advice."""
+        from google.auth.exceptions import TransportError
+
+        from gdoc.util import GdocError
+
+        mock_creds = MagicMock()
+        mock_creds.valid = False
+        mock_creds.expired = True
+        mock_creds.refresh_token = "refresh-xxx"
+        mock_creds.refresh.side_effect = TransportError("dns failure")
+
+        with (
+            patch("gdoc.auth._load_token", return_value=mock_creds),
+            patch("gdoc.auth.Request"),
+        ):
+            with pytest.raises(GdocError) as exc:
+                get_credentials()
+
+        assert "network error" in str(exc.value)
+        assert "dns failure" in str(exc.value)
+        assert not isinstance(exc.value, AuthError)
+        assert exc.value.exit_code == 1
+
 
 class TestDefaultAccount:
     def test_configured_default_resolves_to_named_token(self, tmp_path):

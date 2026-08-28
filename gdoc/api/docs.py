@@ -1,11 +1,13 @@
 """Google Docs API v1 wrapper functions with error translation."""
 
 import re
+from dataclasses import dataclass, field
 from functools import lru_cache
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+from gdoc.api import ACCOUNT_CACHE_SIZE, account_cache_key
 from gdoc.util import (
     AuthError,
     GdocError,
@@ -14,13 +16,16 @@ from gdoc.util import (
 )
 
 
-@lru_cache(maxsize=1)
-def get_docs_service():
-    """Build and cache a Docs API v1 service object."""
+@lru_cache(maxsize=ACCOUNT_CACHE_SIZE)
+def _docs_service(account: str | None, token_stamp):
     from gdoc.auth import get_credentials
 
-    creds = get_credentials()
-    return build("docs", "v1", credentials=creds)
+    return build("docs", "v1", credentials=get_credentials(account))
+
+
+def get_docs_service():
+    """Build or reuse the Docs API v1 service for the current account."""
+    return _docs_service(*account_cache_key())
 
 
 def _translate_http_error(e: HttpError, doc_id: str) -> None:
@@ -635,7 +640,8 @@ def _cell_text_range(cell: dict) -> dict | None:
         content = cell.get("content", [])
         fs = content[0].get("startIndex") if content else None
         return {"startIndex": fs, "endIndex": fs} if fs is not None else None
-    end = last_start + len(last_content)
+    # Doc indexes are UTF-16 code units: an emoji in the cell counts as 2.
+    end = last_start + sum(_utf16_len(ch) for ch in last_content)
     if last_content.endswith("\n"):
         end -= 1  # keep the cell's final paragraph mark
     if end < first_start:
@@ -807,7 +813,13 @@ def _insert_table(
             return
 
         # Parse each cell's markdown to plain text + inline styles, once.
-        from gdoc.mdparse import StyleRange, parse_inline, text_style_fields
+        from gdoc.mdparse import (
+            StyleRange,
+            _utf16_prefix,
+            parse_inline,
+            text_style_fields,
+            utf16_len,
+        )
 
         parsed_cells: dict[tuple[int, int], tuple[str, list]] = {}
         for r_idx, row in enumerate(cell_indices):
@@ -852,10 +864,12 @@ def _insert_table(
                         0, len(plain), {"bold": True}, "text_style",
                     ))
                 base = row[c_idx] + shift
+                # Style offsets are code points; Docs indexes are UTF-16.
+                utf16 = _utf16_prefix(plain)
                 for s in cell_styles:
                     style_range = {
-                        "startIndex": base + s.start,
-                        "endIndex": base + s.end,
+                        "startIndex": base + utf16[s.start],
+                        "endIndex": base + utf16[s.end],
                     }
                     if tab_id:
                         style_range["tabId"] = tab_id
@@ -866,7 +880,7 @@ def _insert_table(
                             "fields": text_style_fields(s.style),
                         }
                     })
-                shift += len(plain)
+                shift += utf16_len(plain)
 
         if text_requests:
             service.documents().batchUpdate(
@@ -1424,7 +1438,7 @@ def insert_markdown_into_tab(
     Returns:
         Dict with "tab_id", "tab_title", "insert_index".
     """
-    from gdoc.mdparse import parse_markdown, to_docs_requests
+    from gdoc.mdparse import parse_markdown, to_docs_requests, utf16_len
 
     if doc is None:
         doc = get_document_with_tabs(doc_id)
@@ -1480,7 +1494,8 @@ def insert_markdown_into_tab(
             # removed before this table, shifting its real position left.
             _insert_table(
                 doc_id,
-                insert_index + table.plain_text_offset
+                insert_index
+                + utf16_len(parsed.plain_text[:table.plain_text_offset])
                 - table.removed_tabs_before,
                 table,
                 tab_id=tab_id,
@@ -1491,6 +1506,44 @@ def insert_markdown_into_tab(
         "tab_title": tab_match["title"],
         "insert_index": insert_index,
     }
+
+
+def _build_replacement_requests(
+    parsed, matches: list[dict], tab_id: str | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Build the delete+insert requests for a find/replace, last-to-first.
+
+    Pure function shared by ``replace_formatted`` (EDIT) and
+    ``suggest_replacement`` (SUGGEST). Matches are processed in descending
+    startIndex order so earlier ranges are unaffected by the length change
+    of later replacements within the one batch.
+
+    Returns (sorted_matches, requests).
+    """
+    from gdoc.mdparse import to_docs_requests
+
+    sorted_matches = sorted(
+        matches, key=lambda m: m["startIndex"], reverse=True,
+    )
+    all_requests: list[dict] = []
+    for match in sorted_matches:
+        # Delete the matched range (skip empty ranges — Docs API rejects
+        # them with "The range should not be empty", and a zero-width
+        # match is a pure insert).
+        if match["endIndex"] > match["startIndex"]:
+            delete_range = {
+                "startIndex": match["startIndex"],
+                "endIndex": match["endIndex"],
+            }
+            if tab_id:
+                delete_range["tabId"] = tab_id
+            all_requests.append({
+                "deleteContentRange": {"range": delete_range}
+            })
+        all_requests.extend(
+            to_docs_requests(parsed, match["startIndex"], tab_id=tab_id)
+        )
+    return sorted_matches, all_requests
 
 
 def replace_formatted(
@@ -1516,41 +1569,20 @@ def replace_formatted(
     Returns:
         Number of replacements made.
     """
-    from gdoc.mdparse import parse_markdown, to_docs_requests
+    from gdoc.mdparse import parse_markdown, utf16_len
 
     parsed = parse_markdown(new_markdown)
 
+    # Same guard as suggest_replacement: overlapping matches ("aa" in
+    # "aaa" with --all) would make the last-to-first delete/insert plan
+    # land on already-shifted text and corrupt the document.
+    _reject_overlapping_matches(matches)
+
     _strip_trailing_newline_unless_hr(parsed)
 
-    # Sort matches by startIndex descending (last-to-first)
-    sorted_matches = sorted(
-        matches, key=lambda m: m["startIndex"], reverse=True,
+    sorted_matches, all_requests = _build_replacement_requests(
+        parsed, matches, tab_id=tab_id,
     )
-
-    all_requests: list[dict] = []
-
-    for match in sorted_matches:
-        # Delete the matched range (skip empty ranges \u2014 Docs API rejects
-        # them with "The range should not be empty", and a zero-width
-        # match is a pure insert).
-        if match["endIndex"] > match["startIndex"]:
-            delete_range = {
-                "startIndex": match["startIndex"],
-                "endIndex": match["endIndex"],
-            }
-            if tab_id:
-                delete_range["tabId"] = tab_id
-            all_requests.append({
-                "deleteContentRange": {
-                    "range": delete_range,
-                }
-            })
-
-        # Insert formatted replacement
-        insert_requests = to_docs_requests(
-            parsed, match["startIndex"], tab_id=tab_id,
-        )
-        all_requests.extend(insert_requests)
 
     if not all_requests:
         return 0
@@ -1587,7 +1619,9 @@ def replace_formatted(
         # createParagraphBullets removes the nested-list indent tabs during
         # the main batch, so each match grows the doc by the post-removal
         # length, not len(plain_text).
-        effective_len = len(parsed.plain_text) - parsed.removed_tabs
+        # Lengths in UTF-16 units: an emoji in the replacement grows the
+        # doc by 2, not 1.
+        effective_len = utf16_len(parsed.plain_text) - parsed.removed_tabs
         delta = effective_len - match_len
         # Matches are sorted descending by startIndex; iterate in
         # that same order so higher positions are cleaned first.
@@ -1612,10 +1646,15 @@ def replace_formatted(
         # Insert tables if any (after main batchUpdate + cleanup)
         if parsed.tables:
             for table in reversed(parsed.tables):
+                # UTF-16 offset of the table placeholder; invariant per
+                # table, so hoisted out of the per-match loop.
+                offset16 = utf16_len(
+                    parsed.plain_text[:table.plain_text_offset],
+                )
                 for j, match in enumerate(sorted_matches):
                     shift = (n - 1 - j) * delta
                     idx = (
-                        match["startIndex"] + table.plain_text_offset
+                        match["startIndex"] + offset16
                         - table.removed_tabs_before + shift
                     )
                     _insert_table(doc_id, idx, table, tab_id=tab_id)
@@ -1623,3 +1662,580 @@ def replace_formatted(
         return len(sorted_matches)
     except HttpError as e:
         _translate_http_error(e, doc_id)
+
+
+# ---------------------------------------------------------------------------
+# Suggested edits (Docs API Developer Preview: writeControl.writeMode=SUGGEST)
+# ---------------------------------------------------------------------------
+
+SUGGESTIONS_INLINE = "SUGGESTIONS_INLINE"
+
+_SUGGEST_UNSUPPORTED_HINT = (
+    "suggest supports plain text and inline formatting (bold, italic, "
+    "strikethrough, code, links); headings, lists, blockquotes, horizontal "
+    "rules, and tables are not supported yet. Use `gdoc edit` to apply "
+    "structural Markdown directly."
+)
+
+
+@dataclass
+class SuggestionResult:
+    """Outcome of a suggest-mode batchUpdate.
+
+    ``created_suggestion_ids`` come from ``suggestionResponses[].
+    createdSuggestionIds``; ``updated_suggestion_ids`` from
+    ``updatedSummarySuggestionIds`` minus anything created in the same batch
+    (Google merges an edit adjacent to the same author's open suggestion
+    into it instead of creating a new one, and also echoes new IDs under
+    "updated"). Both are flattened across responses and de-duplicated in
+    order.
+    """
+
+    occurrences: int
+    created_suggestion_ids: list[str] = field(default_factory=list)
+    updated_suggestion_ids: list[str] = field(default_factory=list)
+    comment_update_state: str = ""
+
+    @property
+    def suggestion_ids(self) -> list[str]:
+        """Every affected suggestion ID, created first, no duplicates."""
+        return _dedupe(self.created_suggestion_ids + self.updated_suggestion_ids)
+
+
+def _dedupe(ids: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for i in ids:
+        if i and i not in seen:
+            seen.add(i)
+            out.append(i)
+    return out
+
+
+def check_inline_only_markdown(parsed) -> None:
+    """Reject replacement Markdown that suggest mode can't represent yet.
+
+    Suggest mode runs one batch only — no read-back cleanup or table
+    insertion phases (those would each have to stay in SUGGEST mode and
+    Google's suggested-structure shapes are unverified). So anything that
+    is not plain text or an inline text style fails here, before any API
+    call, with a usage error (exit 3).
+
+    Newlines are allowed: they become suggested paragraph breaks, and the
+    new paragraphs inherit the anchor paragraph's style (no paragraph-style
+    requests are sent in suggest mode). Fenced code blocks pass too — they
+    parse to plain NORMAL_TEXT paragraphs in the code font.
+    """
+    if parsed.tables:
+        raise GdocError(_SUGGEST_UNSUPPORTED_HINT, exit_code=3)
+    for sr in parsed.styles:
+        if sr.type == "text_style":
+            continue
+        if sr.type == "paragraph_style" and sr.style == {
+            "namedStyleType": "NORMAL_TEXT",
+        }:
+            # Plain paragraphs carry an explicit NORMAL_TEXT; harmless.
+            continue
+        raise GdocError(_SUGGEST_UNSUPPORTED_HINT, exit_code=3)
+
+
+def _inline_only(parsed):
+    """Copy of *parsed* keeping only text styles.
+
+    The NORMAL_TEXT paragraph-style requests ``edit`` sends would become
+    suggested paragraph-style changes on the surrounding paragraph — noise
+    in the review thread. Suggested text inherits the paragraph's style.
+    """
+    from gdoc.mdparse import ParsedMarkdown
+
+    return ParsedMarkdown(
+        plain_text=parsed.plain_text,
+        styles=[s for s in parsed.styles if s.type == "text_style"],
+        tables=[],
+        removed_tabs=0,
+    )
+
+
+def _walk_suggestion_ids(node, out: set[str]) -> None:
+    """Collect every suggestion ID referenced anywhere under *node*.
+
+    Schema-tolerant: any ``suggested*`` list contributes its string values
+    (``suggestedInsertionIds``) and any ``suggested*`` map contributes its
+    keys (``suggestedTextStyleChanges``, and also
+    ``suggestedPositionedObjectIds``, which is a map keyed by suggestion ID
+    despite its name), so new suggestion kinds are picked up without a
+    code change.
+    """
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key.startswith("suggested"):
+                if isinstance(value, list):
+                    out.update(v for v in value if isinstance(v, str))
+                    continue
+                if isinstance(value, dict):
+                    out.update(value.keys())
+                    continue
+            _walk_suggestion_ids(value, out)
+    elif isinstance(node, list):
+        for item in node:
+            _walk_suggestion_ids(item, out)
+
+
+def collect_suggestion_ids(doc: dict) -> set[str]:
+    """All suggestion IDs present in a SUGGESTIONS_INLINE document read."""
+    out: set[str] = set()
+    _walk_suggestion_ids(doc, out)
+    return out
+
+
+def _overlaps(elem: dict, start: int, end: int) -> bool:
+    e_start = elem.get("startIndex", 0)
+    e_end = elem.get("endIndex", e_start)
+    if start == end:
+        # zero-width match: an insertion point inside (or at the end of)
+        # the element
+        return e_start <= start < e_end or (e_start < start <= e_end)
+    return e_start < end and start < e_end
+
+
+def find_suggestions_in_range(body: dict, start: int, end: int) -> set[str]:
+    """Suggestion IDs whose inline content or style map touches [start, end).
+
+    Walks paragraphs (recursing into table cells) read with
+    SUGGESTIONS_INLINE. For an overlapping paragraph, its paragraph-level
+    ``suggested*`` fields count, plus every overlapping element's
+    (``suggestedInsertionIds``, ``suggestedDeletionIds``,
+    ``suggestedTextStyleChanges``, ...). For an overlapping table, the
+    table's, each overlapping row's, and each overlapping cell's own
+    ``suggested*`` fields count too (suggested table/row/cell insertions,
+    deletions, and style changes), before recursing into the cell content.
+    Any other overlapping structural element (a section break, a table of
+    contents) has no index-aware model here, so every suggestion anywhere
+    under it counts — conservative, like ``_container_overlaps``.
+    """
+    found: set[str] = set()
+    for elem in body.get("content", []):
+        if not _overlaps(elem, start, end):
+            continue
+        paragraph = elem.get("paragraph")
+        if paragraph is not None:
+            _walk_container_suggestions(paragraph, found)
+            for pe in paragraph.get("elements", []):
+                if _overlaps(pe, start, end):
+                    _walk_suggestion_ids(pe, found)
+            continue
+        table = elem.get("table")
+        if table is not None:
+            # Container-level suggestions (a suggested table, row, or cell
+            # insertion/deletion/style) are recorded on the container, not
+            # on the text runs inside it.
+            _walk_container_suggestions(table, found)
+            for row in table.get("tableRows", []):
+                if not _container_overlaps(row, start, end):
+                    continue
+                _walk_container_suggestions(row, found)
+                for cell in row.get("tableCells", []):
+                    if not _container_overlaps(cell, start, end):
+                        continue
+                    _walk_container_suggestions(cell, found)
+                    found |= find_suggestions_in_range(cell, start, end)
+            continue
+        # sectionBreak, tableOfContents, or a future element type: a match
+        # can span one (segments concatenate across them), and a suggested
+        # section break / TOC entry is someone's review thread too.
+        _walk_suggestion_ids(elem, found)
+    return found
+
+
+def _container_overlaps(node: dict, start: int, end: int) -> bool:
+    """Rows/cells without index fields are not skipped (be conservative)."""
+    if "startIndex" not in node or "endIndex" not in node:
+        return True
+    return _overlaps(node, start, end)
+
+
+def _walk_container_suggestions(node: dict, out: set[str]) -> None:
+    """Collect this node's own ``suggested*`` fields (no recursion)."""
+    for key, value in node.items():
+        if key.startswith("suggested"):
+            _walk_suggestion_ids({key: value}, out)
+
+
+def _classify_suggest_error(e: HttpError, doc_id: str) -> None:
+    """Translate a suggest-mode batchUpdate HttpError, preserving the reason.
+
+    Never falls back: a suggestion that cannot be made must not become a
+    direct edit.
+    """
+    status = int(e.resp.status)
+    detail = str(e)
+    lowered = detail.lower()
+    if (
+        status == 400
+        and "revision" in lowered
+        and "invalid value" not in lowered
+    ):
+        # A stale requiredRevisionId. A malformed one ("Invalid value at
+        # 'write_control.required_revision_id'") is a bug, not a race, and
+        # must not be reported as "re-run it".
+        raise GdocError(
+            "document changed while the command was running; re-run it "
+            f"(server: {e.reason})"
+        )
+    if status == 400 and (
+        "unknown name" in lowered
+        or "cannot find field" in lowered
+        or "no request set" in lowered
+        or "write_mode" in lowered
+        or "writemode" in lowered
+    ):
+        raise GdocError(
+            "suggest mode not available: the OAuth client's Cloud project "
+            "is not enrolled in the Google Workspace Developer Preview "
+            f"(server rejected the request: {e.reason}). No change was made."
+        )
+    if status == 403:
+        raise GdocError(
+            f"Permission denied: {doc_id} (suggesting through the API needs "
+            "comment or edit access on the document, or the project lacks "
+            "Developer Preview access)"
+        )
+    if status >= 500:
+        # A 5xx can arrive after Google applied the mutation: like a
+        # transport failure, the outcome is unknown and a blind retry may
+        # create a duplicate suggestion.
+        raise GdocError(
+            f"the suggest write returned a server error ({status}: "
+            f"{e.reason}). The outcome is unknown — the suggestion may or "
+            "may not have been saved. Inspect the document before retrying."
+        )
+    _translate_http_error(e, doc_id)
+
+
+def _token_identity(account: str | None) -> tuple[str | None, str | None]:
+    """The (client_id, refresh_token) pair in the account's token file.
+
+    The identity that must hold still between the enrollment gate and the
+    write: Developer Preview enrollment belongs to the OAuth client
+    project (client_id), and the suggestion's author is the granted user
+    (refresh_token — any new grant mints a new one, whether the client or
+    the Google user changed). A routine access-token refresh rewrites the
+    file but keeps both. Missing or unreadable token reads as (None, None).
+    """
+    import json
+
+    from gdoc.util import token_path_for
+
+    try:
+        with token_path_for(account).open() as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return (None, None)
+    if not isinstance(data, dict):
+        return (None, None)
+    return (data.get("client_id"), data.get("refresh_token"))
+
+
+def check_suggest_preview_access(doc_id: str) -> None:
+    """Non-mutating gate: is this OAuth client's project preview-enrolled?
+
+    An unenrolled backend has been observed *ignoring* ``writeMode: SUGGEST``
+    and applying the batch as a direct edit, so enrollment must be proven
+    before the write, not inferred from its response. The decisive probe
+    is a ``documents.get`` with the preview-only ``commentsViewMode`` field:
+    a registered project echoes it (HTTP 200), an unregistered one rejects
+    it (400 ``Unknown name "comments_view_mode"``). Same account, document,
+    and scopes — only the client project changes the answer.
+
+    Sent as a raw authorized GET because the bundled discovery document
+    predates the field and the generated client refuses unknown parameters.
+    """
+    from google.auth.exceptions import GoogleAuthError, TransportError
+    from google.auth.transport.requests import AuthorizedSession
+    from requests.exceptions import RequestException
+
+    from gdoc.auth import get_credentials
+
+    account, _stamp = account_cache_key()
+    try:
+        session = AuthorizedSession(get_credentials(account))
+        resp = session.get(
+            f"https://docs.googleapis.com/v1/documents/{doc_id}",
+            params={
+                # Google requires the two companions ("Comments view mode
+                # may only be specified if tabs content is also requested"
+                # / "... if inline suggestions are also explicitly
+                # requested").
+                "includeTabsContent": "true",
+                "suggestionsViewMode": "SUGGESTIONS_INLINE",
+                "commentsViewMode": "COMMENTS_VIEW_MODE_INCLUDED",
+                "fields": "documentId,commentsViewMode",
+            },
+            timeout=60,
+        )
+    except TransportError as e:
+        # google-auth wraps a network failure during token refresh in
+        # TransportError (a GoogleAuthError subclass) — it is a transport
+        # problem, not bad credentials, so it must not become "run
+        # `gdoc auth`". Fail closed — nothing has been written.
+        raise GdocError(
+            "suggest mode check failed before any write "
+            f"(network error: {e}). No change was made."
+        )
+    except GoogleAuthError as e:
+        # Credentials that could not be refreshed (revoked, expired).
+        raise AuthError(f"Authentication expired ({e}). Run `gdoc auth`.")
+    except RequestException as e:
+        # Transport failure: fail closed — nothing has been written.
+        raise GdocError(
+            "suggest mode check failed before any write "
+            f"(network error: {e}). No change was made."
+        )
+    status = resp.status_code
+    if status == 200:
+        try:
+            mode = resp.json().get("commentsViewMode", "")
+        except ValueError:
+            mode = ""
+        if mode != "COMMENTS_VIEW_MODE_INCLUDED":
+            raise GdocError(
+                "suggest mode not available: the server accepted but did "
+                "not apply the Developer Preview read field, so suggest "
+                "mode cannot be trusted. No change was made."
+            )
+        return
+    detail = resp.text.lower()
+    if status == 400 and (
+        "unknown name" in detail or "cannot find field" in detail
+    ):
+        raise GdocError(
+            "suggest mode not available: the OAuth client's Cloud project "
+            "is not enrolled in the Google Workspace Developer Preview "
+            "(preview read field rejected). No change was made."
+        )
+    if status == 401:
+        raise AuthError("Authentication expired. Run `gdoc auth`.")
+    if status == 403:
+        raise GdocError(
+            f"Permission denied: {doc_id} (reading suggestions needs comment "
+            "or edit access on the document)"
+        )
+    if status == 404:
+        raise GdocError(f"Document not found: {doc_id}")
+    raise GdocError(f"API error ({status}): {resp.reason}")
+
+
+def _reject_overlapping_matches(matches: list[dict]) -> None:
+    """Two matches sharing text (``aa`` in ``aaa``) can't both be replaced:
+    the last-to-first delete/insert plan would land on shifted text."""
+    ordered = sorted(matches, key=lambda m: m["startIndex"])
+    for prev, cur in zip(ordered, ordered[1:]):
+        if cur["startIndex"] < prev["endIndex"]:
+            raise GdocError(
+                "matches overlap each other (the anchor repeats within "
+                f"itself around index {cur['startIndex']}); use a longer "
+                "anchor or drop --all",
+                exit_code=3,
+            )
+
+
+def suggest_replacement(
+    doc_id: str,
+    matches: list[dict],
+    new_markdown: str,
+    revision_id: str,
+    tab_id: str | None = None,
+    expected_token_identity: tuple[str | None, str | None] | None = None,
+) -> SuggestionResult:
+    """Replace matched ranges as *suggested* edits (writeMode=SUGGEST).
+
+    One batchUpdate carries the delete + insert + inline-style requests for
+    every match, with ``writeControl.requiredRevisionId`` pinned to the
+    revision the matches were computed against. Before it, a non-mutating
+    preview read (``check_suggest_preview_access``) proves the project is
+    enrolled, because an unenrolled backend may silently apply the batch as
+    a direct edit. Success requires all of:
+    HTTP 200, ``commentUpdateState == ALL_SAVED``, at least one created or
+    updated suggestion ID in ``suggestionResponses``, and a SUGGESTIONS_INLINE
+    read-back containing every one of those IDs. Anything less raises —
+    there is deliberately no fallback to a direct edit.
+
+    Args:
+        doc_id: The document ID.
+        matches: ``{"startIndex", "endIndex"}`` ranges in the
+            SUGGESTIONS_INLINE index space of *tab_id*.
+        new_markdown: Replacement text; plain or inline Markdown only
+            (see ``check_inline_only_markdown``).
+        revision_id: Non-empty revision the ranges were read at.
+        tab_id: Tab holding the ranges (omitted → first tab).
+        expected_token_identity: ``_token_identity()`` captured before the
+            document read; when given, the pre-write identity check uses it
+            as the baseline, extending the re-auth guard across the read
+            (the CLI passes it). Omitted → the baseline is captured here,
+            guarding the gate→write pair only.
+    """
+    from google.auth.exceptions import GoogleAuthError, TransportError
+
+    from gdoc.mdparse import parse_markdown
+
+    if not revision_id:
+        raise GdocError(
+            "cannot suggest: the document read did not include a revision "
+            "ID, so the write cannot be pinned to the text that was "
+            "matched. Google withholds revisionId from users without "
+            "comment or edit access; suggesting through the API needs at "
+            "least commenter permission on the document."
+        )
+
+    parsed = parse_markdown(new_markdown)
+    check_inline_only_markdown(parsed)
+    _reject_overlapping_matches(matches)
+    _strip_trailing_newline_unless_hr(parsed)
+    sorted_matches, requests = _build_replacement_requests(
+        _inline_only(parsed), matches, tab_id=tab_id,
+    )
+    if not requests:
+        return SuggestionResult(occurrences=0)
+
+    # Prove enrollment with a read before the write (see the gate's doc),
+    # pinning one OAuth identity across both: a re-auth landing between
+    # them could otherwise swap the client project (proving enrollment for
+    # one project while the batch goes through another — which an
+    # unenrolled backend may apply as a direct edit) or the granted user
+    # (authoring the suggestion as someone else). The pin is the token's
+    # (client_id, refresh_token) pair, not the file's identity: a routine
+    # access-token refresh (the gate's own get_credentials persists one
+    # when a long-lived process refreshed only in memory) rewrites the
+    # file but keeps both, and must not abort; any new grant mints a new
+    # refresh_token.
+    account, _stamp = account_cache_key()
+    gate_identity = (
+        expected_token_identity
+        if expected_token_identity is not None
+        else _token_identity(account)
+    )
+    # The gate, the service lookup, and the verification read each resolve
+    # the active account themselves; pin the one captured above so an
+    # unpinned direct call cannot have a concurrent default-account change
+    # split them across two accounts (the CLI and MCP already pin — they
+    # re-enter the same value).
+    from gdoc.util import account_context
+
+    with account_context(account):
+        check_suggest_preview_access(doc_id)
+
+        body = {
+            "requests": requests,
+            "writeControl": {
+                "requiredRevisionId": revision_id,
+                "writeMode": "SUGGEST",
+            },
+        }
+        service = get_docs_service()
+        if _token_identity(account) != gate_identity:
+            raise GdocError(
+                "credentials changed while preparing the suggest write "
+                "(the account was re-authenticated between the enrollment "
+                "check and the write, so the check may have proven a "
+                "different OAuth client project or user). No change was "
+                "made — rerun the command."
+            )
+        try:
+            result = (
+                service.documents()
+                .batchUpdate(documentId=doc_id, body=body)
+                .execute()
+            )
+        except HttpError as e:
+            _classify_suggest_error(e, doc_id)
+        except TransportError as e:
+            # Raised only while refreshing the access token, which happens
+            # before the request is sent — nothing reached Google.
+            raise GdocError(
+                "the suggest write failed before it was sent (network "
+                f"error during token refresh: {e}). No change was made."
+            )
+        except GoogleAuthError as e:
+            # Credential failure (revoked/expired beyond refresh) — also
+            # pre-send, and an auth problem, not an indeterminate write.
+            raise AuthError(f"Authentication expired ({e}). Run `gdoc auth`.")
+        except Exception as e:  # noqa: BLE001 — .execute() is the network
+            # call; a timeout or reset here can land after Google has
+            # accepted the write, so the outcome is genuinely
+            # indeterminate. A generic unexpected error would let the
+            # caller retry blindly.
+            raise GdocError(
+                "the suggest write failed in transit "
+                f"({str(e) or type(e).__name__}). The outcome is unknown — "
+                "the suggestion may or may not have been saved. Inspect "
+                "the document before retrying."
+            )
+
+        state = result.get("commentUpdateState", "")
+        created: list[str] = []
+        updated: list[str] = []
+        for resp in result.get("suggestionResponses", []) or []:
+            created.extend(resp.get("createdSuggestionIds", []) or [])
+            updated.extend(resp.get("updatedSummarySuggestionIds", []) or [])
+        created = _dedupe(created)
+        # Google echoes a just-created ID under updatedSummarySuggestionIds
+        # as well; report as "updated" only threads that existed before this
+        # batch (i.e. the edit was merged into the author's open suggestion).
+        updated = [sid for sid in _dedupe(updated) if sid not in created]
+        outcome = SuggestionResult(
+            occurrences=len(sorted_matches),
+            created_suggestion_ids=created,
+            updated_suggestion_ids=updated,
+            comment_update_state=state,
+        )
+
+        if state != "ALL_SAVED" or not outcome.suggestion_ids:
+            # The server answered 200 but produced no durable review object:
+            # either it ignored writeMode (an unenrolled backend has been
+            # seen applying the change directly) or the suggestion thread
+            # failed to save. Say so loudly; the caller must inspect the
+            # document.
+            raise GdocError(
+                "suggest mode was not applied: the server returned "
+                f"commentUpdateState={state or 'none'} and "
+                f"{len(outcome.suggestion_ids)} suggestion ID(s)"
+                + (
+                    # Name any IDs that did come back: some review objects
+                    # may exist, and a caller deciding whether to retry
+                    # must be able to find them.
+                    " (" + ", ".join(outcome.suggestion_ids) + ")"
+                    if outcome.suggestion_ids
+                    else ""
+                )
+                + ". The Cloud project may lack Developer Preview access. "
+                "Check the document — the text may have been edited "
+                "directly."
+            )
+
+        try:
+            readback = get_document_structure(
+                doc_id, suggestions_view_mode=SUGGESTIONS_INLINE,
+            )
+        except Exception as e:  # noqa: BLE001 — the write succeeded; only
+            # the verification read failed, either as a GdocError from the
+            # API layer or as an untranslated transport error (timeout,
+            # reset). A bare "API error (503)" — or a naked ConnectionError
+            # — would hide that a suggestion very likely exists now.
+            raise GdocError(
+                "suggestion(s) " + ", ".join(outcome.suggestion_ids)
+                + " were reported saved but could not be verified "
+                f"({str(e) or type(e).__name__}); inspect the document",
+                exit_code=getattr(e, "exit_code", 1),
+            )
+        present = collect_suggestion_ids(readback)
+        missing = [
+            sid for sid in outcome.suggestion_ids if sid not in present
+        ]
+        if missing:
+            raise GdocError(
+                "suggestion not found on read-back: "
+                + ", ".join(missing)
+                + ". The server reported it but the document does not show "
+                "it as a pending suggestion; inspect the document."
+            )
+        return outcome

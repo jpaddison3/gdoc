@@ -177,6 +177,20 @@ class TestReplaceFormatted:
         assert first_del["deleteContentRange"]["range"]["startIndex"] == 20
 
     @patch("gdoc.api.docs.get_docs_service")
+    def test_overlapping_matches_are_rejected(self, mock_svc):
+        """`aa` in `aaa` matches [1,3) and [2,4): the last-to-first plan
+        would land on shifted text, so refuse — same guard as suggest."""
+        chain = _docs_chain(mock_svc)
+        matches = [
+            {"startIndex": 1, "endIndex": 3},
+            {"startIndex": 2, "endIndex": 4},
+        ]
+        with pytest.raises(GdocError, match="overlap each other") as exc:
+            replace_formatted("d1", matches, "b", "r1")
+        assert exc.value.exit_code == 3
+        chain.batchUpdate.assert_not_called()
+
+    @patch("gdoc.api.docs.get_docs_service")
     def test_formatted_replacement(self, mock_svc):
         """Markdown generates style requests."""
         chain = _docs_chain(mock_svc)
