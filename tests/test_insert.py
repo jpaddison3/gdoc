@@ -9,6 +9,8 @@ import pytest
 from gdoc.cli import cmd_insert
 from gdoc.notify import ChangeInfo
 from gdoc.util import GdocError
+from tests.conftest import doc_with_tabs as _tabs_doc
+from tests.conftest import whole_doc_read_state as _read_state
 
 
 def _make_args(**overrides):
@@ -38,27 +40,6 @@ def _insert_result(tab_id="t.todo", tab_title="TODO", insert_index=1):
 
 def _preflight_ok():
     return ChangeInfo(current_version=10, last_read_version=10)
-
-
-def _tabs_doc(*pairs):
-    """A get_document_with_tabs() response for the given (id, title) pairs."""
-    return {
-        "revisionId": "rev1",
-        "tabs": [
-            {
-                "tabProperties": {"tabId": tid, "title": title, "index": i},
-                "documentTab": {"body": {"content": []}},
-            }
-            for i, (tid, title) in enumerate(pairs)
-        ],
-    }
-
-
-def _read_state(version=11):
-    """State proving a whole-doc read at `version` (0.20 provenance)."""
-    from gdoc.state import DocState
-
-    return DocState(last_read_version=version, global_read_covers_doc=True)
 
 
 class TestInsertBasic:

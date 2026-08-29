@@ -1,4 +1,4 @@
-"""Per-tab write-conflict baselines (0.14.0).
+"""Per-tab write-conflict baselines (0.22.0).
 
 The lenient effective-baseline rule: a `write --tab X` is allowed when
 max(whole-doc last_read_version, tab_read_versions[X]) equals the current doc
@@ -17,6 +17,7 @@ from gdoc.cli import cmd_cat, cmd_write
 from gdoc.notify import ChangeInfo
 from gdoc.state import DocState, load_state, save_state
 from gdoc.util import GdocError
+from tests.conftest import doc_with_tabs as _doc_with_tabs
 
 DOC_MIME = "application/vnd.google-apps.document"
 
@@ -25,20 +26,6 @@ def _tab_dict(tab_id, title):
     return {
         "id": tab_id, "title": title, "index": 0,
         "nesting_level": 0, "body": {"content": []},
-    }
-
-
-def _doc_with_tabs(*pairs):
-    """A get_document_with_tabs() response for the given (id, title) pairs."""
-    return {
-        "revisionId": "rev1",
-        "tabs": [
-            {
-                "tabProperties": {"tabId": tid, "title": title, "index": i},
-                "documentTab": {"body": {"content": []}},
-            }
-            for i, (tid, title) in enumerate(pairs)
-        ],
     }
 
 
@@ -316,14 +303,14 @@ class TestTabBaselineUrlParity:
 
 
 class TestLegacyBaselineProvenance:
-    """F18: a pre-0.20 state file's last_read_version is ambiguous (it may
+    """F18: a pre-0.22 state file's last_read_version is ambiguous (it may
     record a tab-scoped read) and must not authorize a tab write."""
 
     def test_legacy_global_baseline_is_not_trusted(self, tmp_path):
         f = tmp_path / "body.md"
         f.write_text("# new\n")
         with patch("gdoc.state.STATE_DIR", tmp_path):
-            # Simulates a pre-0.20 file: field filtered in as default False.
+            # Simulates a pre-0.22 file: field filtered in as default False.
             save_state("abc123", DocState(last_version=100,
                                           last_read_version=100))
             with patch("gdoc.api.docs.get_document_with_tabs",

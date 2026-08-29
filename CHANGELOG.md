@@ -6,6 +6,7 @@ All notable changes to `gdoc` are documented here. This project follows
 
 ## [0.22.0] — 2026-08-28
 
+
 ### Added
 - **Document URLs honor their `?tab=` deep link.** Google's editor appends
   `?tab=<id>` when you open a tab, so a pasted tab URL now acts exactly like
@@ -14,6 +15,7 @@ All notable changes to `gdoc` are documented here. This project follows
   command, wired in via this release's merge) — previously the tab was silently dropped
   and the command operated on the first tab (or whole doc). An explicit
   `--tab`/`--all-tabs` still overrides the URL.
+
 
 ### Fixed
 - **Per-tab write-conflict baselines.** The write guard now tracks a read
@@ -57,6 +59,7 @@ All notable changes to `gdoc` are documented here. This project follows
   the same rule as `cat --tab X`: on a multi-tab doc it stamps only that
   tab's baseline, not the whole-doc one.
 
+
 ### Changed
 - State files gain a `tab_read_versions` map and a
   `global_read_covers_doc` provenance marker. Older state files load
@@ -81,6 +84,7 @@ All notable changes to `gdoc` are documented here. This project follows
 - **`gdoc insert` no longer requires `--tab`** when the document URL already
   carries a `?tab=`.
 
+
 ### Notes
 - Combining a URL tab with a whole-document flag errors (exit 3) and names the
   URL as the source: `cat --comments`/`--revision`,
@@ -96,6 +100,7 @@ All notable changes to `gdoc` are documented here. This project follows
   error now points this out).
 - Spreadsheet `#gid=` deep links are still unparsed — select a worksheet with
   `--tab`/`--range`.
+
 
 ### Docs
 - Corrected the README Tabs section: the Drive export returns **all** tabs
