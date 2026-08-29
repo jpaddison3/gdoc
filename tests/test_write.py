@@ -11,30 +11,8 @@ from gdoc.cli import cmd_write
 from gdoc.notify import ChangeInfo
 from gdoc.state import DocState
 from gdoc.util import AuthError, GdocError
-
-
-def _doc_with_tabs(*tabs):
-    """Build a get_document_with_tabs() response for the given tabs.
-
-    Each arg is an ``(id, title)`` pair. cmd_write's per-tab branch fetches
-    this doc, flattens it, and resolves the requested tab against it before
-    the conflict check — so a tab-write test must supply a matching tab here.
-    """
-    return {
-        "revisionId": "rev1",
-        "tabs": [
-            {
-                "tabProperties": {"tabId": tid, "title": title, "index": i},
-                "documentTab": {"body": {"content": []}},
-            }
-            for i, (tid, title) in enumerate(tabs)
-        ],
-    }
-
-
-def _read_state(version=11):
-    """State proving a whole-doc read at `version` (0.20 provenance)."""
-    return DocState(last_read_version=version, global_read_covers_doc=True)
+from tests.conftest import doc_with_tabs as _doc_with_tabs
+from tests.conftest import whole_doc_read_state as _read_state
 
 
 def _make_args(**overrides):

@@ -1,8 +1,8 @@
 # Tab-scoped commands: `comments`, `images`, `toc`, `diff`
 
 Status: **PROPOSAL — none of this is implemented.** (Discussed 2026-07-04/05,
-JP + Claude. "PR #4" below = the `?tab=` URL support that shipped in 0.20.0;
-as of 0.20.0, `diff`/`comments`/`images` print a discard NOTE.) Companion to
+JP + Claude. "PR #4" below = the `?tab=` URL support that shipped in 0.22.0;
+as of 0.22.0, `diff`/`comments`/`images` print a discard NOTE.) Companion to
 `per-tab-read-baselines-plan.md`; follows PR #4 (URL `?tab=` support). This is the "R3"
 workstream: the commands PR #4 left silently discarding `?tab=`, now given real tab
 behavior instead of a discard NOTE.
@@ -82,7 +82,7 @@ uniqueness).
   and `matched_tabs: [...]`; top-level `omitted_other_tabs: N`.
 - **Terse output sketch:**
 
-  ```
+  ```text
   # tab: Budget (t.abc123)
   #AAABxyz [open] someone@example.com 2026-06-30
     "Can we cut this?"
