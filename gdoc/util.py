@@ -204,8 +204,11 @@ _PATTERNS = [
 _BARE_ID = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 # Tab ids look like `t.0`, `t.abc123` — the dot distinguishes them from
-# doc-id charsets, so it must be included in the capture class.
-_TAB_PARAM = re.compile(r"[?&]tab=([A-Za-z0-9._-]+)")
+# doc-id charsets, so it must be included in the capture class. `&amp;` is
+# accepted alongside `?`/`&` because a URL copied out of rendered HTML keeps
+# the escaped separator: failing to match there would silently downgrade a
+# tab-scoped `edit`/`write` to the whole-doc path.
+_TAB_PARAM = re.compile(r"(?:[?&]|&amp;)tab=([A-Za-z0-9._-]+)")
 
 
 def confirm_destructive(message: str, force: bool = False) -> None:

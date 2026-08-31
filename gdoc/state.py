@@ -161,6 +161,15 @@ def update_state_after_command(
     # (the pre-flight version is from BEFORE the mutation; this is from AFTER)
     if command_version is not None and command not in ("cat", "info"):
         state.last_version = command_version
+        # The post-op version is exactly one past pre-flight, so the bump is
+        # attributable solely to our own metadata change. Shared by the global
+        # and per-tab healing rules below so the two cannot drift apart.
+        attributable_bump = (
+            metadata_only_write
+            and change_info is not None
+            and change_info.current_version is not None
+            and command_version == change_info.current_version + 1
+        )
         # A successful full-content write doubles as a read: the doc now
         # contains exactly what we sent, so advance the conflict baseline.
         # Without this, a later push false-conflicts against our own write.
@@ -169,13 +178,7 @@ def update_state_after_command(
         if full_doc_write:
             state.last_read_version = command_version
             state.global_read_covers_doc = True
-        elif (
-            metadata_only_write
-            and change_info is not None
-            and change_info.current_version is not None
-            and not change_info.has_conflict
-            and command_version == change_info.current_version + 1
-        ):
+        elif attributable_bump and not change_info.has_conflict:
             # Content is untouched, the baseline was current going in,
             # and the post-op version is exactly one past the pre-flight
             # read — the bump is attributable solely to our own metadata
@@ -192,12 +195,7 @@ def update_state_after_command(
         # has_conflict guard: after a tab-only read the global baseline is
         # unset, which reads as a conflict there, yet each per-tab entry
         # proves its own currency by matching the pre-flight version.
-        if (
-            metadata_only_write
-            and change_info is not None
-            and change_info.current_version is not None
-            and command_version == change_info.current_version + 1
-        ):
+        if attributable_bump:
             for tid, ver in state.tab_read_versions.items():
                 if ver == change_info.current_version:
                     state.tab_read_versions[tid] = command_version
