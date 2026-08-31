@@ -13,8 +13,8 @@ All designs below were validated live on 2026-07-05 against a real 7-tab work do
 comments (read-only probes). Key findings, which several designs depend on:
 
 - **The Drive markdown export includes ALL tabs**, each preceded by a `# **{tab title}**`
-  heading line, in Docs-API tab order. (README's "export only returns the first tab" is
-  stale — fix it as part of this work.)
+  heading line, in Docs-API tab order. (README's "export only returns the first tab" was
+  stale; corrected in 0.22.0, so this is no longer a follow-up for this workstream.)
 - **`get_tab_text` emits plain text**, not markdown (0 bold/link/heading markers on a doc
   full of them). Per-tab *markdown* only exists inside the whole-doc export.
 - **`gdoc images` returns wrong answers today**: `list_inline_objects` uses
@@ -142,7 +142,12 @@ Resolve X → current title via the Docs API tab list. Scan the export **in tab 
 find each tab's `# **{title}**` heading line sequentially (each search starting after the
 previous boundary); tab X's slice runs from its heading to the next tab's heading (or
 EOF). Ordered scanning is what contains the main threat — a user-authored heading
-identical to a *later* tab's title.
+identical to a *later* tab's title. It does not *eliminate* it: a `# **B**` a user wrote
+inside tab A is found before the real tab-B heading and truncates A's slice early, in
+order, so the out-of-order check below can't see it. On the current side the oracle
+catches this; on a revision there is no oracle, which is the residual risk the rejection
+rules must be sized against — treat any tab whose slice comes back shorter than its
+neighbours' heading spacing suggests as ambiguous, and refuse.
 
 ### Failure semantics — the opposite of comments: fail LOUD, never open
 
@@ -188,5 +193,5 @@ mismatch); mode wiring tests for FILE / `--rev` / `--since`; `?tab=t.0` stays wh
 2. `comments` bucketing (validated, pure-function core),
 3. `diff` slicing (heuristic, loud-fail, benefits from the others' tab plumbing).
 
-Each is independently shippable; README's stale export claim gets fixed with whichever
-lands first.
+Each is independently shippable. (README's stale export claim was the one cross-cutting
+follow-up here; it was corrected in 0.22.0 and needs no further work.)

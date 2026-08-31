@@ -32,6 +32,9 @@ All notable changes to `gdoc` are documented here. This project follows
     conflict on the second write (the first write bumped the doc version but
     the tab-scoped write left the baseline behind). A tab write now advances
     that tab's own baseline, so repeated edits to one tab just work.
+- **HTML-escaped `&amp;tab=` in a pasted URL is honored.** A doc URL copied
+  out of rendered HTML keeps the escaped separator; the tab id used to go
+  unseen, silently downgrading `edit`/`write` to the whole-doc path.
 - **`insert --tab X` accepts a `cat --tab X` baseline.** The tab-populate
   flow the collapse-guard error recommends no longer demands a whole-doc
   read: `insert` runs the same per-tab conflict check as `write --tab`.

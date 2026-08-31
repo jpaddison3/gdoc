@@ -117,6 +117,22 @@ class TestExtractDocRef:
         url = "https://docs.google.com/document/d/1aBcDeFg/edit?subtab=t.9"
         assert extract_doc_ref(url) == ("1aBcDeFg", None)
 
+    def test_html_escaped_separator_still_finds_tab(self):
+        # A URL copied out of rendered HTML keeps "&amp;" as the separator.
+        # Missing the tab there is not a no-op: the caller silently falls
+        # back to the whole-doc path and edits outside the intended tab.
+        url = (
+            "https://docs.google.com/document/d/1aBcDeFg/edit"
+            "?usp=sharing&amp;tab=t.xyz"
+        )
+        assert extract_doc_ref(url) == ("1aBcDeFg", "t.xyz")
+
+    def test_escaped_separator_does_not_relax_the_name_anchor(self):
+        # The &amp; alternative must not become a wildcard: a param whose
+        # name merely ends in "tab" is still rejected.
+        url = "https://docs.google.com/document/d/1aBcDeFg/edit?a=1&amp;subtab=t.9"
+        assert extract_doc_ref(url) == ("1aBcDeFg", None)
+
     def test_bare_id_has_no_tab(self):
         assert extract_doc_ref("1aBcDeFgHiJkLmNoPqRsTuVwXyZ") == (
             "1aBcDeFgHiJkLmNoPqRsTuVwXyZ",

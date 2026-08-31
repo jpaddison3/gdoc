@@ -64,7 +64,7 @@ class DocState:
 | Action | `last_read_version` | `tab_read_versions` |
 |---|---|---|
 | `cat` (plain, Drive export — includes ALL tabs) / `pull` | advance (correct: full read) | — |
-| `cat --tab X` / `cat '<url>?tab=X'` | **no longer advanced** | `[X] = current` |
+| `cat --tab X` / `cat '<url>?tab=X'` | **no longer advanced** — except on a single-tab doc, where the one tab IS the whole doc (advance) | `[X] = current` |
 | `cat --all-tabs` | advance | — (subsumed by global under the lenient rule) |
 | `cat --revision`, `pull --revision`, `toc`, `info` | unchanged (status quo) | — |
 | `write` / `push` (full doc, success) | `= post-write version` (status quo) | — |
@@ -120,7 +120,11 @@ anything — same as today's quiet behavior for `last_read_version`.
 
 2. **`gdoc/cli.py` — read side (`cmd_cat`)**
    - Tab path (`resolve_tab` already called here): pass `match["id"]` as `read_tab_id`;
-     stop advancing `last_read_version` for this path.
+     stop advancing `last_read_version` for this path. **Exception:** when the doc has
+     exactly one tab, reading that tab is a whole-doc read — take the normal whole-doc
+     path (advance `last_read_version`) instead, or a subsequent whole-doc write
+     false-conflicts against a read that did cover everything. `write --tab X` applies
+     the mirror-image rule (`full_doc_write=(len(all_tabs) == 1)`).
    - `--all-tabs` path: unchanged (whole-doc semantics; global baseline covers all tabs).
 
 3. **`gdoc/cli.py` — write side (`cmd_write` tab branch)**
